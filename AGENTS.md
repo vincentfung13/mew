@@ -28,4 +28,4 @@ The architecture is cleanly separated into two main packages:
 ## 4. Code Formatting and Linting
 *   **Always format the code with `black`.**
 *   **Check for lint errors with `flake8`**, but strictly ignore the "line too long" error (`E501`).
-*   **Scope:** Only apply `black` formatting and `flake8` linting to the core packages `@mew/` and `@apps/`. Do not run them on other directories or files in the repository.
+*   **Scope:** Only apply `uvx black` formatting and `uvx flake8` linting to the core packages `@mew/` and `@apps/`. Do not run them on other directories or files in the repository.

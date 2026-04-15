@@ -9,17 +9,18 @@ class RotaryPositionalEmbedding(nn.Module):
         super().__init__()
         assert d_k % 2 == 0
         self.d_k = d_k
+        self.theta = theta
 
         # ks & inverse_freq -> (d_k_half)
         # inds -> (max_seq_len)
         ks = torch.arange(1, d_k // 2 + 1, device=device).float()
-        inverse_freq = 1.0 / (theta ** ((2 * ks - 2) / d_k))
+        self.inverse_freq = 1.0 / (theta ** ((2 * ks - 2) / d_k))
         inds = torch.arange(0, max_seq_len, device=device).float()
 
         # Init sin and cos cache
         # compute outer product
         # freqs -> (max_seq_len, d_k_half)
-        freqs = einsum(inds, inverse_freq, "seq_len, d_k_half -> seq_len d_k_half")
+        freqs = einsum(inds, self.inverse_freq, "seq_len, d_k_half -> seq_len d_k_half")
         if device is not None:
             freqs = freqs.to(device)
 
@@ -27,9 +28,25 @@ class RotaryPositionalEmbedding(nn.Module):
         self.register_buffer("sin", freqs.sin())
         self.register_buffer("cos", freqs.cos())
 
+    def _update_cache(self, max_seq_len: int):
+        inds = torch.arange(0, max_seq_len, device=self.sin.device).float()
+        freqs = einsum(
+            inds,
+            self.inverse_freq.to(self.sin.device),
+            "seq_len, d_k_half -> seq_len d_k_half",
+        )
+        self.register_buffer("sin", freqs.sin())
+        self.register_buffer("cos", freqs.cos())
+
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
         # x -> (... seq_len d_k)
         # token_positions -> (... seq_len)
+
+        # if token_positions has elements larger than the cached freq length,
+        if token_positions.max() >= self.sin.size(0):
+            # dynamically extend sin and cos
+            max_seq_len = int(token_positions.max().item()) + 1
+            self._update_cache(max_seq_len)
 
         # Select sin and cos based on token positions
         sin_selected = self.sin[token_positions]  # (... seq_len, d_k_half)

@@ -13,12 +13,15 @@ class BaseConditionalGenerator:
         training_cfg = OmegaConf.load(cfg_path)
 
         # Init model
+        self.device = device
         self.model = build_model(
-            model_cfg=training_cfg,
+            cfg=training_cfg,
         ).to(device)
 
         # Load state dict
-        state_dict = torch.load(model_path)["model"]
+        state_dict = torch.load(model_path, weights_only=False, map_location=device)[
+            "model"
+        ]
         self.model.load_state_dict(state_dict, strict=True)
 
         # Set to eval mode
@@ -39,14 +42,16 @@ class BaseConditionalGenerator:
         # 1. Convert prompt to tokens
         prompt_tokens = self.tokenizer.encode(prompt)
         prompt_length = len(prompt_tokens)
-        stop_token_ind = self.tokenizer.get_token_ind[stop_token]
+        stop_token_ind = self.tokenizer.get_token_ind[stop_token.encode("utf-8")]
 
         # 2. Iteratively generate tokens
         for _ in range(max_new_tokens):
             # 2.1. Convert token list to tensor
-            input_tensor = torch.tensor(
-                prompt_tokens, dtype=torch.long, device=self.model.device
-            ).unsqueeze(0)
+            input_tensor = (
+                torch.tensor(prompt_tokens, dtype=torch.long)
+                .unsqueeze(0)
+                .to(self.device)
+            )
 
             # 2.2. Run through the model to obtain logits
             logits = self.model(input_tensor)  # (B, vocab_size)
@@ -66,4 +71,4 @@ class BaseConditionalGenerator:
         # Convert token list back to string
         output_str = self.tokenizer.decode(prompt_tokens[prompt_length:])
 
-        return output_str
+        return prompt + output_str
