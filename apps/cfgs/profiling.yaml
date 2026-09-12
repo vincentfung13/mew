@@ -1,0 +1,30 @@
+defaults:
+  - training
+  - _self_
+  - override hydra/job_logging: custom
+
+device: cuda
+
+data:
+  batch_size: 4
+  seq_len: 256
+
+model:
+  d_model: 768
+  d_ff: 3072
+  num_heads: 12
+  num_groups: null
+  vocab_size: 10000
+  num_transformer_layers: 12
+  rope_theta: 10000.0
+  context_len: ${data.seq_len}
+
+profiling:
+  warmup:
+    steps: 10
+    run_backward: true
+    run_optimizer_step: true
+  exec:
+    steps: 10
+    run_backward: true
+    run_optimizer_step: true
