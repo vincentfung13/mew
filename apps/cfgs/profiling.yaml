@@ -20,11 +20,12 @@ model:
   context_len: ${data.seq_len}
 
 profiling:
-  warmup:
-    steps: 10
-    run_backward: true
-    run_optimizer_step: true
-  exec:
-    steps: 10
-    run_backward: true
-    run_optimizer_step: true
+  warmup_steps: 10
+  exec_steps: 10
+  nvtx:
+    # Attach per-module forward hooks so Nsight Systems renders each module
+    # (e.g. SwiGLU, CausalMultiHeadSelfAttn) as a range nested under "forward".
+    annotate_modules: true
+    # Bracket the measured steps with cudaProfilerStart/Stop. Pair with
+    # `nsys profile --capture-range=cudaProfilerApi` to record only these steps.
+    use_cudart_range: true
