@@ -7,6 +7,8 @@
 # no nsys report). Example:
 #   USE_NSYS=0 ./examples/run_profiling.sh
 USE_NSYS=${USE_NSYS:-1}
+ENABLE_AMP=${ENABLE_AMP:-true}
+AMP_DTYPE=${AMP_DTYPE:-bf16}
 
 run_profiling() {
     local model_size=$1
@@ -14,6 +16,9 @@ run_profiling() {
     local d_ff=$3
     local num_heads=$4
     local num_transformer_layers=$5
+    local amp_enable=$6
+    local amp_dtype=$7
+    local mem_profile_output_path=$8
 
     echo ""
     echo "=========================================="
@@ -40,7 +45,11 @@ run_profiling() {
             model.num_groups=null \
             model.num_transformer_layers=$num_transformer_layers \
             profiling.nvtx.annotate_modules=true \
-            profiling.nvtx.use_cudart_range=true
+            profiling.nvtx.use_cudart_range=true \
+            profiling.memory_profiling.enable=true \
+            profiling.memory_profiling.output_path=$mem_profile_output_path \
+            amp.enable=$amp_enable \
+            amp.dtype=$amp_dtype
     else
         # No nsys capture: skip the cudaProfilerStart/Stop bracket (nothing is
         # listening) but keep the module NVTX ranges (cheap no-ops off-profiler).
@@ -51,7 +60,11 @@ run_profiling() {
             model.num_groups=null \
             model.num_transformer_layers=$num_transformer_layers \
             profiling.nvtx.annotate_modules=true \
-            profiling.nvtx.use_cudart_range=false
+            profiling.nvtx.use_cudart_range=false \
+            profiling.memory_profiling.enable=true \
+            profiling.memory_profiling.output_path=$mem_profile_output_path \
+            amp.enable=$amp_enable \
+            amp.dtype=$amp_dtype
     fi
 
     if [ $? -ne 0 ]; then
@@ -63,16 +76,16 @@ run_profiling() {
 echo "Starting profiling sweep..."
 
 # small: d_model=768, d_ff=3072, num_heads=12, num_transformer_layers=12
-run_profiling "small" 768 3072 12 12
+run_profiling "small" 768 3072 12 12 $ENABLE_AMP $AMP_DTYPE mem_profiile_small.pkl
 
 # medium: d_model=1024, d_ff=4096, num_heads=16, num_transformer_layers=24
-run_profiling "medium" 1024 4096 16 24
+run_profiling "medium" 1024 4096 16 24 $ENABLE_AMP $AMP_DTYPE mem_profiile_medium.pkl
 
 # large: d_model=1280, d_ff=5120, num_heads=20, num_transformer_layers=36
-run_profiling "large" 1280 5120 20 36
+run_profiling "large" 1280 5120 20 36 $ENABLE_AMP $AMP_DTYPE mem_profiile_large.pkl
 
 # xl: d_model=2560, d_ff=10240, num_heads=20, num_transformer_layers=36
-run_profiling "xl" 2560 10240 20 36
+run_profiling "xl" 2560 10240 20 36 $ENABLE_AMP $AMP_DTYPE mem_profiile_xl.pkl
 
 # 10b: d_model=4608, d_ff=12288, num_heads=36, num_transformer_layers=50
 # run_profiling "10b" 4608 12288 36 50

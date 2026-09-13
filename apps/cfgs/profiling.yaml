@@ -19,6 +19,11 @@ model:
   rope_theta: 10000.0
   context_len: ${data.seq_len}
 
+amp:
+  enable: true
+  # fp16 & bf16
+  dtype: bf16 
+
 profiling:
   warmup_steps: 10
   exec_steps: 10
@@ -29,3 +34,6 @@ profiling:
     # Bracket the measured steps with cudaProfilerStart/Stop. Pair with
     # `nsys profile --capture-range=cudaProfilerApi` to record only these steps.
     use_cudart_range: true
+  memory_profiling:
+    enable: true
+    output_path: mem_profile_dump.pkl

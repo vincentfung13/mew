@@ -55,6 +55,15 @@ def main(cfg: DictConfig) -> None:
         nvtx_handles = attach_nvtx_hooks(model)
         LOGGER.info("Attached per-module NVTX hooks.")
 
+    # AMP config
+    try:
+        amp_dtype = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[cfg.amp.dtype]
+    except KeyError:
+        raise ValueError(f"Unsupported AMP dtype: {cfg.amp.dtype}")
+
     # Init fake optim and fake data
     optim = AdamW(
         params=model.parameters(),
@@ -80,12 +89,15 @@ def main(cfg: DictConfig) -> None:
 
     # Warmup
     LOGGER.info("Starting to warmup...")
-    for _ in tqdm(list(range(cfg.profiling.warmup_steps))):
-        optim.zero_grad()
-        logits = model(fake_data)
-        loss = cross_entropy(logits, fake_label)
-        loss.backward()
-        optim.step()
+    with torch.autocast(
+        device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
+    ):
+        for _ in tqdm(list(range(cfg.profiling.warmup_steps))):
+            optim.zero_grad()
+            logits = model(fake_data)
+            loss = cross_entropy(logits, fake_label)
+            loss.backward()
+            optim.step()
 
     # Wait for the warmup to finish
     if cfg.device == "cuda":
@@ -112,33 +124,50 @@ def main(cfg: DictConfig) -> None:
         "optimizer_step": [],
         "total": [],
     }
+
+    # Enable GPU memory profiling
+    if cfg.profiling.memory_profiling.enable and cfg.device == "cuda":
+        LOGGER.info("Enabling GPU memory profiling...")
+        torch.cuda.memory._record_memory_history(enabled="all")
+
     LOGGER.info("Starting to execute profiling...")
-    for _ in tqdm(list(range(cfg.profiling.exec_steps))):
-        optim.zero_grad()
+    with torch.autocast(
+        device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
+    ):
+        for _ in tqdm(list(range(cfg.profiling.exec_steps))):
+            optim.zero_grad()
 
-        total_start = _now()
+            total_start = _now()
 
-        forward_start = total_start
-        with torch.cuda.nvtx.range("forward"):
-            logits = model(fake_data)
-            loss = cross_entropy(logits, fake_label)
-            forward_end = _now()
-            timings["forward"].append(forward_end - forward_start)
+            forward_start = total_start
+            with torch.cuda.nvtx.range("forward"):
+                logits = model(fake_data)
+                loss = cross_entropy(logits, fake_label)
+                forward_end = _now()
+                timings["forward"].append(forward_end - forward_start)
 
-        with torch.cuda.nvtx.range("backward"):
-            backward_start = forward_end
-            loss.backward()
-            backward_end = _now()
-            timings["backward"].append(backward_end - backward_start)
+            with torch.cuda.nvtx.range("backward"):
+                backward_start = forward_end
+                loss.backward()
+                backward_end = _now()
+                timings["backward"].append(backward_end - backward_start)
 
-        with torch.cuda.nvtx.range("optimizer_step"):
-            optimizer_start = _now()
-            optim.step()
-            optimizer_end = _now()
-            timings["optimizer_step"].append(optimizer_end - optimizer_start)
+            with torch.cuda.nvtx.range("optimizer_step"):
+                optimizer_start = _now()
+                optim.step()
+                optimizer_end = _now()
+                timings["optimizer_step"].append(optimizer_end - optimizer_start)
 
-        total_end = _now()
-        timings["total"].append(total_end - total_start)
+            total_end = _now()
+            timings["total"].append(total_end - total_start)
+
+    if cfg.profiling.memory_profiling.enable and cfg.device == "cuda":
+        torch.cuda.memory._dump_snapshot(cfg.profiling.memory_profiling.output_path)
+        LOGGER.info(
+            f"Mem profiling results dumped to {cfg.profiling.memory_profiling.output_path}..."
+        )
+        torch.cuda.memory._record_memory_history(enabled=None)
+
     if is_cuda and cfg.profiling.nvtx.use_cudart_range:
         torch.cuda.profiler.stop()
 
