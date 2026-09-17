@@ -25,8 +25,10 @@ amp:
   dtype: bf16 
 
 profiling:
+  output_dir: profiles/default
   warmup_steps: 10
   exec_steps: 10
+  forward_only: true
   nvtx:
     # Attach per-module forward hooks so Nsight Systems renders each module
     # (e.g. SwiGLU, CausalMultiHeadSelfAttn) as a range nested under "forward".
@@ -37,3 +39,7 @@ profiling:
   memory_profiling:
     enable: true
     output_path: mem_profile_dump.pkl
+
+hydra:
+  run:
+    dir: ${profiling.output_dir}

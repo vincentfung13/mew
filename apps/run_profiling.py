@@ -1,6 +1,8 @@
 import hydra
 import logging
 import timeit
+from contextlib import nullcontext
+from pathlib import Path
 from typing import List
 from omegaconf import DictConfig
 from tqdm import tqdm
@@ -15,7 +17,7 @@ from mew.optimizers.adamw import AdamW
 LOGGER = logging.getLogger(__name__)
 
 
-def attach_nvtx_hooks(
+def _attach_nvtx_hooks(
     model: torch.nn.Module,
 ) -> List[torch.utils.hooks.RemovableHandle]:
     """Attach forward pre/post hooks that emit an NVTX range per submodule.
@@ -44,6 +46,13 @@ def attach_nvtx_hooks(
 
 @hydra.main(version_base=None, config_path="cfgs", config_name="profiling")
 def main(cfg: DictConfig) -> None:
+    is_cuda = cfg.device == "cuda"
+    output_dir = Path(cfg.profiling.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    memory_profile_output_path = Path(cfg.profiling.memory_profiling.output_path)
+    if not memory_profile_output_path.is_absolute():
+        memory_profile_output_path = output_dir / memory_profile_output_path
+
     # Init model
     model = build_model(cfg, device=cfg.device)
     LOGGER.info(f"Initialized model with config: {cfg.model}")
@@ -51,18 +60,21 @@ def main(cfg: DictConfig) -> None:
     # Optionally attach per-module NVTX hooks so Nsight Systems shows a
     # hierarchy (e.g. SwiGLU / CausalMultiHeadSelfAttn nested under "forward").
     nvtx_handles: List[torch.utils.hooks.RemovableHandle] = []
-    if cfg.profiling.nvtx.annotate_modules:
-        nvtx_handles = attach_nvtx_hooks(model)
+    if is_cuda and cfg.profiling.nvtx.annotate_modules:
+        nvtx_handles = _attach_nvtx_hooks(model)
         LOGGER.info("Attached per-module NVTX hooks.")
 
     # AMP config
-    try:
-        amp_dtype = {
-            "fp16": torch.float16,
-            "bf16": torch.bfloat16,
-        }[cfg.amp.dtype]
-    except KeyError:
-        raise ValueError(f"Unsupported AMP dtype: {cfg.amp.dtype}")
+    if cfg.amp.enable:
+        try:
+            amp_dtype = {
+                "fp16": torch.float16,
+                "bf16": torch.bfloat16,
+            }[cfg.amp.dtype]
+        except KeyError:
+            raise ValueError(f"Unsupported AMP dtype: {cfg.amp.dtype}")
+    else:
+        amp_dtype = torch.bfloat16
 
     # Init fake optim and fake data
     optim = AdamW(
@@ -87,31 +99,60 @@ def main(cfg: DictConfig) -> None:
         size=(cfg.data.batch_size, cfg.data.seq_len),
     ).to(cfg.device)
 
-    # Warmup
-    LOGGER.info("Starting to warmup...")
-    with torch.autocast(
-        device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
-    ):
-        for _ in tqdm(list(range(cfg.profiling.warmup_steps))):
-            optim.zero_grad()
-            logits = model(fake_data)
-            loss = cross_entropy(logits, fake_label)
-            loss.backward()
-            optim.step()
-
-    # Wait for the warmup to finish
-    if cfg.device == "cuda":
-        torch.cuda.synchronize()
-
-    # Exec
-    is_cuda = cfg.device == "cuda"
-
     def _now() -> float:
         # Synchronize before reading the clock so that each measured stage
         # only accounts for its own (asynchronous) CUDA work.
         if is_cuda:
             torch.cuda.synchronize()
         return timeit.default_timer()
+
+    def _nvtx_range(name: str):
+        if is_cuda:
+            return torch.cuda.nvtx.range(name)
+        return nullcontext()
+
+    def _profiling_step_once():
+        timings = {}
+        total_start = _now()
+        if cfg.profiling.forward_only:
+            with torch.no_grad(), _nvtx_range("forward"):
+                model(fake_data)
+            forward_end = _now()
+            timings["forward"] = forward_end - total_start
+        else:
+            optim.zero_grad()
+            with _nvtx_range("forward"):
+                logits = model(fake_data)
+            loss = cross_entropy(logits, fake_label)
+            forward_end = _now()
+            timings["forward"] = forward_end - total_start
+
+            with _nvtx_range("backward"):
+                backward_start = _now()
+                loss.backward()
+                backward_end = _now()
+                timings["backward"] = backward_end - backward_start
+
+            with _nvtx_range("optimizer_step"):
+                optimizer_start = _now()
+                optim.step()
+                optimizer_end = _now()
+                timings["optimizer_step"] = optimizer_end - optimizer_start
+        total_end = _now()
+        timings["total"] = total_end - total_start
+        return timings
+
+    # Warmup
+    LOGGER.info("Starting to warmup...")
+    with torch.autocast(
+        device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
+    ):
+        for _ in tqdm(list(range(cfg.profiling.warmup_steps))):
+            _profiling_step_once()
+
+    # Wait for the warmup to finish
+    if cfg.device == "cuda":
+        torch.cuda.synchronize()
 
     # Per-stage latency samples (in seconds).
     if is_cuda and cfg.profiling.nvtx.use_cudart_range:
@@ -135,37 +176,13 @@ def main(cfg: DictConfig) -> None:
         device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
     ):
         for _ in tqdm(list(range(cfg.profiling.exec_steps))):
-            optim.zero_grad()
-
-            total_start = _now()
-
-            forward_start = total_start
-            with torch.cuda.nvtx.range("forward"):
-                logits = model(fake_data)
-                loss = cross_entropy(logits, fake_label)
-                forward_end = _now()
-                timings["forward"].append(forward_end - forward_start)
-
-            with torch.cuda.nvtx.range("backward"):
-                backward_start = forward_end
-                loss.backward()
-                backward_end = _now()
-                timings["backward"].append(backward_end - backward_start)
-
-            with torch.cuda.nvtx.range("optimizer_step"):
-                optimizer_start = _now()
-                optim.step()
-                optimizer_end = _now()
-                timings["optimizer_step"].append(optimizer_end - optimizer_start)
-
-            total_end = _now()
-            timings["total"].append(total_end - total_start)
+            _timings = _profiling_step_once()
+            for stage, duration in _timings.items():
+                timings[stage].append(duration)
 
     if cfg.profiling.memory_profiling.enable and cfg.device == "cuda":
-        torch.cuda.memory._dump_snapshot(cfg.profiling.memory_profiling.output_path)
-        LOGGER.info(
-            f"Mem profiling results dumped to {cfg.profiling.memory_profiling.output_path}..."
-        )
+        torch.cuda.memory._dump_snapshot(str(memory_profile_output_path))
+        LOGGER.info(f"Mem profiling results dumped to {memory_profile_output_path}...")
         torch.cuda.memory._record_memory_history(enabled=None)
 
     if is_cuda and cfg.profiling.nvtx.use_cudart_range:
