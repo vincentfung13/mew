@@ -144,10 +144,10 @@ def main(cfg: DictConfig) -> None:
 
     # Warmup
     LOGGER.info("Starting to warmup...")
-    with torch.autocast(
-        device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
-    ):
-        for _ in tqdm(list(range(cfg.profiling.warmup_steps))):
+    for _ in tqdm(list(range(cfg.profiling.warmup_steps))):
+        with torch.autocast(
+            device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
+        ):
             _profiling_step_once()
 
     # Wait for the warmup to finish
@@ -172,10 +172,10 @@ def main(cfg: DictConfig) -> None:
         torch.cuda.memory._record_memory_history(enabled="all")
 
     LOGGER.info("Starting to execute profiling...")
-    with torch.autocast(
-        device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
-    ):
-        for _ in tqdm(list(range(cfg.profiling.exec_steps))):
+    for _ in tqdm(list(range(cfg.profiling.exec_steps))):
+        with torch.autocast(
+            device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
+        ):
             _timings = _profiling_step_once()
             for stage, duration in _timings.items():
                 timings[stage].append(duration)

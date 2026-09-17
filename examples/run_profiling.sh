@@ -56,6 +56,7 @@ run_profiling() {
         # The profiling.nvtx flags enable per-module NVTX ranges and that
         # cudaProfilerStart/Stop bracket.
         uv run nsys profile \
+            --cuda-memory-usage=true \
             --capture-range=cudaProfilerApi \
             --capture-range-end=stop \
             --output="$report_path" \
@@ -97,9 +98,9 @@ run_profiling() {
 echo "Starting profiling sweep..."
 
 MODEL_SPECS=(
-    "small 768 3072 12 12"
-    "medium 1024 4096 16 24"
-    "large 1280 5120 20 36"
+    # "small 768 3072 12 12"
+    # "medium 1024 4096 16 24"
+    # "large 1280 5120 20 36"
     "xl 2560 10240 20 36"
     # "10b 4608 12288 36 50"
 )
