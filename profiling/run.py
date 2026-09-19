@@ -43,7 +43,7 @@ def main(cfg: DictConfig) -> None:
     memory_profile_output_path = output_dir / f"{output_dir.name}.pkl"
 
     case = build_profiling_case(cfg, device=cfg.device)
-    module = case.module
+    eager_module = case.module
     LOGGER.info(
         "Initialized profiling target %s with case config: %s",
         cfg.case.name,
@@ -51,9 +51,24 @@ def main(cfg: DictConfig) -> None:
     )
 
     nvtx_handles: List[torch.utils.hooks.RemovableHandle] = []
-    if is_cuda and cfg.profiling.nvtx.annotate_modules:
-        nvtx_handles = _attach_nvtx_hooks(module)
+    if (
+        is_cuda
+        and cfg.profiling.nvtx.annotate_modules
+        and not cfg.torch_compile.enable
+    ):
+        nvtx_handles = _attach_nvtx_hooks(eager_module)
         LOGGER.info("Attached per-module NVTX hooks.")
+    elif is_cuda and cfg.profiling.nvtx.annotate_modules:
+        LOGGER.info(
+            "Skipping per-module NVTX hooks because they can cause graph breaks "
+            "with torch.compile."
+        )
+
+    if cfg.torch_compile.enable:
+        module = torch.compile(eager_module, mode=cfg.torch_compile.mode)
+        LOGGER.info("Enabled torch.compile with mode=%s.", cfg.torch_compile.mode)
+    else:
+        module = eager_module
 
     if cfg.amp.enable:
         try:
@@ -67,7 +82,7 @@ def main(cfg: DictConfig) -> None:
         amp_dtype = torch.bfloat16
 
     optim = AdamW(
-        params=module.parameters(),
+        params=eager_module.parameters(),
         lr=0.01,
         weight_decay=0.01,
         betas=[0.9, 0.95],

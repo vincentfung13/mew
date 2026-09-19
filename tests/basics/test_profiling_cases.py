@@ -15,6 +15,8 @@ def test_profiling_case_config_composes_independently(target):
         cfg = compose(config_name="profiling", overrides=[f"case={target}"])
 
     assert cfg.case.name == target
+    assert cfg.torch_compile.enable is False
+    assert cfg.torch_compile.mode == "default"
     assert "data" not in cfg
     assert "model" not in cfg
 

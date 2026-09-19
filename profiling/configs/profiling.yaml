@@ -9,6 +9,11 @@ amp:
   # fp16 or bf16
   dtype: bf16
 
+torch_compile:
+  enable: false
+  # default, reduce-overhead, max-autotune, or max-autotune-no-cudagraphs
+  mode: default
+
 profiling:
   output_dir: profiles/default
   warmup_steps: 10

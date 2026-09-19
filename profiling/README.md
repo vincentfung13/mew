@@ -22,6 +22,22 @@ USE_NSYS=0 ./profiling/examples/run_lm_sweep.sh
 USE_NSYS=0 ./profiling/examples/run_attention_sweep.sh
 ```
 
+Enable `torch.compile` for either sweep with environment variables:
+
+```bash
+TORCH_COMPILE=1 \
+TORCH_COMPILE_MODE=reduce-overhead \
+USE_NSYS=0 \
+./profiling/examples/run_attention_sweep.sh
+```
+
+`TORCH_COMPILE` defaults to `0`. `TORCH_COMPILE_MODE` defaults to `default` and
+also accepts `reduce-overhead`, `max-autotune`, and
+`max-autotune-no-cudagraphs`. With at least one warmup step, initial compilation
+occurs during warmup and is excluded from measured iterations. Per-module NVTX
+hooks are disabled for compiled runs because they can introduce graph breaks;
+the outer stage ranges remain enabled.
+
 The attention example sweeps `d_model` over `16`, `32`, `64`, and `128` and
 `seq_len` over `256`, `1024`, `4096`, `8192`, and `16384`, always with one
 attention head and batch size eight. The batch size is included in every output
@@ -48,14 +64,16 @@ uv run skills/pytorch-memory-report/scripts/render_memory_report.py \
     --output profiles/<run-name>/memory-report.html
 ```
 
-Memory snapshots and Nsight reports are named after their output directory. For
-example, `profiling.output_dir=profiles/attention_b8_d64_s4096_h1_fp32_full_step`
+Memory snapshots and Nsight reports are named after their output directory. The
+directory includes `eager` or `compile_<mode>` so compiled and eager artifacts
+cannot overwrite one another. For example,
+`profiling.output_dir=profiles/attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_step`
 writes:
 
 ```text
-profiles/attention_b8_d64_s4096_h1_fp32_full_step/
-├── attention_b8_d64_s4096_h1_fp32_full_step.pkl
-└── attention_b8_d64_s4096_h1_fp32_full_step.nsys-rep
+profiles/attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_step/
+├── attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_step.pkl
+└── attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_step.nsys-rep
 ```
 
 The `.nsys-rep` file is produced only when `USE_NSYS=1`. Nsight Systems adds

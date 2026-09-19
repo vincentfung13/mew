@@ -5,6 +5,29 @@
 USE_NSYS=${USE_NSYS:-1}
 AMP_DTYPE=${AMP_DTYPE:-bf16}
 OUTPUT_DIR=${OUTPUT_DIR:-profiles}
+TORCH_COMPILE=${TORCH_COMPILE:-0}
+TORCH_COMPILE_MODE=${TORCH_COMPILE_MODE:-default}
+
+case "$TORCH_COMPILE" in
+    1 | true)
+        torch_compile_enable=true
+        ;;
+    0 | false)
+        torch_compile_enable=false
+        ;;
+    *)
+        echo "TORCH_COMPILE must be one of: 0, 1, false, true" >&2
+        exit 2
+        ;;
+esac
+
+case "$TORCH_COMPILE_MODE" in
+    default | reduce-overhead | max-autotune | max-autotune-no-cudagraphs) ;;
+    *)
+        echo "Unsupported TORCH_COMPILE_MODE: $TORCH_COMPILE_MODE" >&2
+        exit 2
+        ;;
+esac
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -27,7 +50,12 @@ run_profiling() {
         step_tag="forward_only"
     fi
 
-    local run_name="${target}_${case_name}_${precision_tag}_${step_tag}"
+    local compile_tag="eager"
+    if [ "$torch_compile_enable" = "true" ]; then
+        compile_tag="compile_${TORCH_COMPILE_MODE//-/_}"
+    fi
+
+    local run_name="${target}_${case_name}_${compile_tag}_${precision_tag}_${step_tag}"
     local run_output_dir="${OUTPUT_DIR}/${run_name}"
     # Nsight adds the .nsys-rep extension to this output prefix.
     local report_path="${run_output_dir}/${run_name}"
@@ -55,6 +83,8 @@ run_profiling() {
             profiling.output_dir="$run_output_dir" \
             profiling.memory_profiling.enable=true \
             profiling.forward_only="$forward_only" \
+            torch_compile.enable="$torch_compile_enable" \
+            torch_compile.mode="$TORCH_COMPILE_MODE" \
             amp.enable="$amp_enable" \
             amp.dtype="$amp_dtype"
     else
@@ -66,6 +96,8 @@ run_profiling() {
             profiling.output_dir="$run_output_dir" \
             profiling.memory_profiling.enable=true \
             profiling.forward_only="$forward_only" \
+            torch_compile.enable="$torch_compile_enable" \
+            torch_compile.mode="$TORCH_COMPILE_MODE" \
             amp.enable="$amp_enable" \
             amp.dtype="$amp_dtype"
     fi
