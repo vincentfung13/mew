@@ -1,18 +1,17 @@
-import hydra
 import logging
 import timeit
 from contextlib import nullcontext
 from pathlib import Path
 from typing import List
+
+import hydra
+import numpy as np
+import torch
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-import numpy as np
-import torch
-
-from mew.nn.utils import build_model
-from mew.nn.functionals import cross_entropy
 from mew.optimizers.adamw import AdamW
+from profiling.cases import build_profiling_case
 
 LOGGER = logging.getLogger(__name__)
 
@@ -20,15 +19,7 @@ LOGGER = logging.getLogger(__name__)
 def _attach_nvtx_hooks(
     model: torch.nn.Module,
 ) -> List[torch.utils.hooks.RemovableHandle]:
-    """Attach forward pre/post hooks that emit an NVTX range per submodule.
-
-    Each module's forward is bracketed by ``range_push``/``range_pop`` so that
-    Nsight Systems renders the modules as a hierarchy nested under whatever
-    higher-level range (e.g. "forward") is open on the same thread. The range is
-    labelled ``<ClassName>`` (e.g. ``SwiGLU``, ``CausalMultiHeadSelfAttn``).
-
-    Returns the list of registered handles so the caller can remove them.
-    """
+    """Attach forward hooks that emit an NVTX range per submodule."""
     handles: List[torch.utils.hooks.RemovableHandle] = []
     for _, module in model.named_modules():
         label = type(module).__name__
@@ -44,64 +35,46 @@ def _attach_nvtx_hooks(
     return handles
 
 
-@hydra.main(version_base=None, config_path="cfgs", config_name="profiling")
+@hydra.main(version_base=None, config_path="configs", config_name="profiling")
 def main(cfg: DictConfig) -> None:
     is_cuda = cfg.device == "cuda"
     output_dir = Path(cfg.profiling.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    memory_profile_output_path = Path(cfg.profiling.memory_profiling.output_path)
-    if not memory_profile_output_path.is_absolute():
-        memory_profile_output_path = output_dir / memory_profile_output_path
+    memory_profile_output_path = output_dir / f"{output_dir.name}.pkl"
 
-    # Init model
-    model = build_model(cfg, device=cfg.device)
-    LOGGER.info(f"Initialized model with config: {cfg.model}")
+    case = build_profiling_case(cfg, device=cfg.device)
+    module = case.module
+    LOGGER.info(
+        "Initialized profiling target %s with case config: %s",
+        cfg.case.name,
+        cfg.case,
+    )
 
-    # Optionally attach per-module NVTX hooks so Nsight Systems shows a
-    # hierarchy (e.g. SwiGLU / CausalMultiHeadSelfAttn nested under "forward").
     nvtx_handles: List[torch.utils.hooks.RemovableHandle] = []
     if is_cuda and cfg.profiling.nvtx.annotate_modules:
-        nvtx_handles = _attach_nvtx_hooks(model)
+        nvtx_handles = _attach_nvtx_hooks(module)
         LOGGER.info("Attached per-module NVTX hooks.")
 
-    # AMP config
     if cfg.amp.enable:
         try:
             amp_dtype = {
                 "fp16": torch.float16,
                 "bf16": torch.bfloat16,
             }[cfg.amp.dtype]
-        except KeyError:
-            raise ValueError(f"Unsupported AMP dtype: {cfg.amp.dtype}")
+        except KeyError as error:
+            raise ValueError(f"Unsupported AMP dtype: {cfg.amp.dtype}") from error
     else:
         amp_dtype = torch.bfloat16
 
-    # Init fake optim and fake data
     optim = AdamW(
-        params=model.parameters(),
-        # These params does not matter since we're
-        # only doing profiling
+        params=module.parameters(),
         lr=0.01,
         weight_decay=0.01,
         betas=[0.9, 0.95],
         eps=0.01,
     )
 
-    # Sample random batch (reused repeatedly)
-    fake_data = torch.randint(
-        low=0,
-        high=cfg.model.vocab_size - 1,
-        size=(cfg.data.batch_size, cfg.data.seq_len),
-    ).to(cfg.device)
-    fake_label = torch.randint(
-        low=0,
-        high=cfg.model.vocab_size - 1,
-        size=(cfg.data.batch_size, cfg.data.seq_len),
-    ).to(cfg.device)
-
     def _now() -> float:
-        # Synchronize before reading the clock so that each measured stage
-        # only accounts for its own (asynchronous) CUDA work.
         if is_cuda:
             torch.cuda.synchronize()
         return timeit.default_timer()
@@ -116,14 +89,14 @@ def main(cfg: DictConfig) -> None:
         total_start = _now()
         if cfg.profiling.forward_only:
             with torch.no_grad(), _nvtx_range("forward"):
-                model(fake_data)
+                module(*case.inputs)
             forward_end = _now()
             timings["forward"] = forward_end - total_start
         else:
             optim.zero_grad()
             with _nvtx_range("forward"):
-                logits = model(fake_data)
-            loss = cross_entropy(logits, fake_label)
+                output = module(*case.inputs)
+            loss = case.loss_fn(output)
             forward_end = _now()
             timings["forward"] = forward_end - total_start
 
@@ -142,22 +115,17 @@ def main(cfg: DictConfig) -> None:
         timings["total"] = total_end - total_start
         return timings
 
-    # Warmup
-    LOGGER.info("Starting to warmup...")
-    for _ in tqdm(list(range(cfg.profiling.warmup_steps))):
+    LOGGER.info("Starting to warm up...")
+    for _ in tqdm(range(cfg.profiling.warmup_steps)):
         with torch.autocast(
             device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
         ):
             _profiling_step_once()
 
-    # Wait for the warmup to finish
-    if cfg.device == "cuda":
+    if is_cuda:
         torch.cuda.synchronize()
 
-    # Per-stage latency samples (in seconds).
     if is_cuda and cfg.profiling.nvtx.use_cudart_range:
-        # Pair with `nsys profile --capture-range=cudaProfilerApi` so only the
-        # measured (post-warmup) steps are recorded in the report.
         torch.cuda.profiler.start()
     timings: dict[str, list[float]] = {
         "forward": [],
@@ -166,33 +134,30 @@ def main(cfg: DictConfig) -> None:
         "total": [],
     }
 
-    # Enable GPU memory profiling
-    if cfg.profiling.memory_profiling.enable and cfg.device == "cuda":
+    if cfg.profiling.memory_profiling.enable and is_cuda:
         LOGGER.info("Enabling GPU memory profiling...")
         torch.cuda.memory._record_memory_history(enabled="all")
 
-    LOGGER.info("Starting to execute profiling...")
-    for _ in tqdm(list(range(cfg.profiling.exec_steps))):
+    LOGGER.info("Starting profiling execution...")
+    for _ in tqdm(range(cfg.profiling.exec_steps)):
         with torch.autocast(
             device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
         ):
-            _timings = _profiling_step_once()
-            for stage, duration in _timings.items():
+            step_timings = _profiling_step_once()
+            for stage, duration in step_timings.items():
                 timings[stage].append(duration)
 
-    if cfg.profiling.memory_profiling.enable and cfg.device == "cuda":
+    if cfg.profiling.memory_profiling.enable and is_cuda:
         torch.cuda.memory._dump_snapshot(str(memory_profile_output_path))
-        LOGGER.info(f"Mem profiling results dumped to {memory_profile_output_path}...")
+        LOGGER.info("Memory profiling results dumped to %s", memory_profile_output_path)
         torch.cuda.memory._record_memory_history(enabled=None)
 
     if is_cuda and cfg.profiling.nvtx.use_cudart_range:
         torch.cuda.profiler.stop()
 
-    # Remove NVTX hooks now that measurement is done.
     for handle in nvtx_handles:
         handle.remove()
 
-    # Compute and log statistics as a table.
     LOGGER.info("Profiling Results:")
     header = (
         f"{'stage':<16}{'count':>8}{'mean (s)':>14}"
@@ -204,11 +169,11 @@ def main(cfg: DictConfig) -> None:
         samples = timings[stage]
         if not samples:
             continue
-        arr = np.array(samples)
+        values = np.array(samples)
         LOGGER.info(
-            f"{stage:<16}{len(arr):>8}{np.mean(arr):>14.6f}"
-            f"{np.var(arr):>16.6e}{np.percentile(arr, 95):>14.6f}"
-            f"{np.percentile(arr, 99):>14.6f}"
+            f"{stage:<16}{len(values):>8}{np.mean(values):>14.6f}"
+            f"{np.var(values):>16.6e}{np.percentile(values, 95):>14.6f}"
+            f"{np.percentile(values, 99):>14.6f}"
         )
 
 
