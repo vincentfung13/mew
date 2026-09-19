@@ -17,7 +17,10 @@ LM_SPECS=(
 )
 
 AMP_ENABLES=(true false)
-FORWARD_ONLY_FLAGS=(true false)
+PROTOCOLS=(
+    forward_only
+    full_training_step
+)
 
 echo "Starting full-LM profiling sweep..."
 

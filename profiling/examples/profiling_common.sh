@@ -35,7 +35,7 @@ run_profiling() {
     local target=$1
     local case_name=$2
     local amp_enable=$3
-    local forward_only=$4
+    local protocol=$4
     local amp_dtype=$5
     shift 5
     local case_overrides=("$@")
@@ -45,17 +45,12 @@ run_profiling() {
         precision_tag="amp_${amp_dtype}"
     fi
 
-    local step_tag="full_step"
-    if [ "$forward_only" = "true" ]; then
-        step_tag="forward_only"
-    fi
-
     local compile_tag="eager"
     if [ "$torch_compile_enable" = "true" ]; then
         compile_tag="compile_${TORCH_COMPILE_MODE//-/_}"
     fi
 
-    local run_name="${target}_${case_name}_${compile_tag}_${precision_tag}_${step_tag}"
+    local run_name="${target}_${case_name}_${compile_tag}_${precision_tag}_${protocol}"
     local run_output_dir="${OUTPUT_DIR}/${run_name}"
     # Nsight adds the .nsys-rep extension to this output prefix.
     local report_path="${run_output_dir}/${run_name}"
@@ -82,7 +77,7 @@ run_profiling() {
             profiling.nvtx.use_cudart_range=true \
             profiling.output_dir="$run_output_dir" \
             profiling.memory_profiling.enable=true \
-            profiling.forward_only="$forward_only" \
+            profiling.protocol="$protocol" \
             torch_compile.enable="$torch_compile_enable" \
             torch_compile.mode="$TORCH_COMPILE_MODE" \
             amp.enable="$amp_enable" \
@@ -95,7 +90,7 @@ run_profiling() {
             profiling.nvtx.use_cudart_range=false \
             profiling.output_dir="$run_output_dir" \
             profiling.memory_profiling.enable=true \
-            profiling.forward_only="$forward_only" \
+            profiling.protocol="$protocol" \
             torch_compile.enable="$torch_compile_enable" \
             torch_compile.mode="$TORCH_COMPILE_MODE" \
             amp.enable="$amp_enable" \
@@ -110,12 +105,12 @@ run_all_modes() {
     local case_overrides=("$@")
 
     for amp_enable in "${AMP_ENABLES[@]}"; do
-        for forward_only in "${FORWARD_ONLY_FLAGS[@]}"; do
+        for protocol in "${PROTOCOLS[@]}"; do
             run_profiling \
                 "$target" \
                 "$case_name" \
                 "$amp_enable" \
-                "$forward_only" \
+                "$protocol" \
                 "$AMP_DTYPE" \
                 "${case_overrides[@]}"
         done

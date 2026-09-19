@@ -16,7 +16,9 @@ NUM_HEADS=1
 BATCH_SIZE=8
 
 AMP_ENABLES=(true false)
-FORWARD_ONLY_FLAGS=(true false)
+PROTOCOLS=(
+    repeat_backward_on_same_graph
+)
 
 echo "Starting self-attention profiling sweep..."
 

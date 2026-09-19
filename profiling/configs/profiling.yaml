@@ -18,7 +18,8 @@ profiling:
   output_dir: profiles/default
   warmup_steps: 10
   exec_steps: 10
-  forward_only: true
+  # forward_only, full_training_step, or repeat_backward_on_same_graph
+  protocol: forward_only
   nvtx:
     annotate_modules: true
     use_cudart_range: true

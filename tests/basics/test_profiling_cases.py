@@ -17,6 +17,7 @@ def test_profiling_case_config_composes_independently(target):
     assert cfg.case.name == target
     assert cfg.torch_compile.enable is False
     assert cfg.torch_compile.mode == "default"
+    assert cfg.profiling.protocol == "forward_only"
     assert "data" not in cfg
     assert "model" not in cfg
 

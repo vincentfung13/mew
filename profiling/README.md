@@ -9,11 +9,26 @@ Run one target directly with Hydra overrides:
 ```bash
 uv run python -m profiling.run \
     case=attention \
+    profiling.protocol=full_training_step \
     case.batch_size=8 \
     case.seq_len=1024 \
     case.d_model=2048 \
     case.num_heads=16
 ```
+
+Three execution protocols are available through `profiling.protocol`:
+
+- `forward_only`: runs `exec_steps` forwards under `torch.no_grad()`.
+- `full_training_step`: runs `exec_steps` iterations of gradient reset, forward,
+  loss, backward, and optimizer update.
+- `repeat_backward_on_same_graph`: resets gradients once, runs `exec_steps`
+  forwards, and then backpropagates through the final forward graph
+  `exec_steps` times without updating parameters. The graph is retained between
+  backward calls and released after the final call.
+
+Warmup follows the same ordering as the selected protocol. Timings include each
+individual operation. The repeated-backward protocol additionally reports
+aggregate `forward_phase` and `backward_phase` timings.
 
 Run a focused sweep without Nsight Systems capture:
 
@@ -67,13 +82,13 @@ uv run skills/pytorch-memory-report/scripts/render_memory_report.py \
 Memory snapshots and Nsight reports are named after their output directory. The
 directory includes `eager` or `compile_<mode>` so compiled and eager artifacts
 cannot overwrite one another. For example,
-`profiling.output_dir=profiles/attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_step`
+`profiling.output_dir=profiles/attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_training_step`
 writes:
 
 ```text
-profiles/attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_step/
-├── attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_step.pkl
-└── attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_step.nsys-rep
+profiles/attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_training_step/
+├── attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_training_step.pkl
+└── attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_training_step.nsys-rep
 ```
 
 The `.nsys-rep` file is produced only when `USE_NSYS=1`. Nsight Systems adds

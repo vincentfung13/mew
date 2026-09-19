@@ -1,6 +1,7 @@
 import logging
 import timeit
-from contextlib import nullcontext
+from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List
 
@@ -8,10 +9,10 @@ import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig
-from tqdm import tqdm
 
 from mew.optimizers.adamw import AdamW
 from profiling.cases import build_profiling_case
+from profiling.protocols import parse_protocol, run_protocol
 
 LOGGER = logging.getLogger(__name__)
 
@@ -43,19 +44,19 @@ def main(cfg: DictConfig) -> None:
     memory_profile_output_path = output_dir / f"{output_dir.name}.pkl"
 
     case = build_profiling_case(cfg, device=cfg.device)
+    protocol = parse_protocol(cfg.profiling.protocol)
     eager_module = case.module
     LOGGER.info(
-        "Initialized profiling target %s with case config: %s",
+        "Initialized profiling target %s with protocol %s and case config: %s",
         cfg.case.name,
+        protocol.value,
         cfg.case,
     )
 
     nvtx_handles: List[torch.utils.hooks.RemovableHandle] = []
-    if (
-        is_cuda
-        and cfg.profiling.nvtx.annotate_modules
-        and not cfg.torch_compile.enable
-    ):
+    module_annotation_enabled = is_cuda and cfg.profiling.nvtx.annotate_modules
+    compile_disabled = not cfg.torch_compile.enable
+    if module_annotation_enabled and compile_disabled:
         nvtx_handles = _attach_nvtx_hooks(eager_module)
         LOGGER.info("Attached per-module NVTX hooks.")
     elif is_cuda and cfg.profiling.nvtx.annotate_modules:
@@ -94,73 +95,56 @@ def main(cfg: DictConfig) -> None:
             torch.cuda.synchronize()
         return timeit.default_timer()
 
-    def _nvtx_range(name: str):
+    timings: dict[str, list[float]] = defaultdict(list)
+
+    @contextmanager
+    def _stage(name: str, *, collect_timings: bool):
+        if collect_timings:
+            start = _now()
         if is_cuda:
-            return torch.cuda.nvtx.range(name)
-        return nullcontext()
-
-    def _profiling_step_once():
-        timings = {}
-        total_start = _now()
-        if cfg.profiling.forward_only:
-            with torch.no_grad(), _nvtx_range("forward"):
-                module(*case.inputs)
-            forward_end = _now()
-            timings["forward"] = forward_end - total_start
-        else:
-            optim.zero_grad()
-            with _nvtx_range("forward"):
-                output = module(*case.inputs)
-            loss = case.loss_fn(output)
-            forward_end = _now()
-            timings["forward"] = forward_end - total_start
-
-            with _nvtx_range("backward"):
-                backward_start = _now()
-                loss.backward()
-                backward_end = _now()
-                timings["backward"] = backward_end - backward_start
-
-            with _nvtx_range("optimizer_step"):
-                optimizer_start = _now()
-                optim.step()
-                optimizer_end = _now()
-                timings["optimizer_step"] = optimizer_end - optimizer_start
-        total_end = _now()
-        timings["total"] = total_end - total_start
-        return timings
+            torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            if is_cuda:
+                torch.cuda.nvtx.range_pop()
+            if collect_timings:
+                timings[name].append(_now() - start)
 
     LOGGER.info("Starting to warm up...")
-    for _ in tqdm(range(cfg.profiling.warmup_steps)):
-        with torch.autocast(
-            device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
-        ):
-            _profiling_step_once()
+    with torch.autocast(
+        device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
+    ):
+        run_protocol(
+            protocol,
+            steps=cfg.profiling.warmup_steps,
+            module=module,
+            case=case,
+            optimizer=optim,
+            stage=lambda name: _stage(name, collect_timings=False),
+        )
 
     if is_cuda:
         torch.cuda.synchronize()
 
     if is_cuda and cfg.profiling.nvtx.use_cudart_range:
         torch.cuda.profiler.start()
-    timings: dict[str, list[float]] = {
-        "forward": [],
-        "backward": [],
-        "optimizer_step": [],
-        "total": [],
-    }
-
     if cfg.profiling.memory_profiling.enable and is_cuda:
         LOGGER.info("Enabling GPU memory profiling...")
         torch.cuda.memory._record_memory_history(enabled="all")
 
     LOGGER.info("Starting profiling execution...")
-    for _ in tqdm(range(cfg.profiling.exec_steps)):
-        with torch.autocast(
-            device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
-        ):
-            step_timings = _profiling_step_once()
-            for stage, duration in step_timings.items():
-                timings[stage].append(duration)
+    with torch.autocast(
+        device_type=cfg.device, dtype=amp_dtype, enabled=cfg.amp.enable
+    ):
+        run_protocol(
+            protocol,
+            steps=cfg.profiling.exec_steps,
+            module=module,
+            case=case,
+            optimizer=optim,
+            stage=lambda name: _stage(name, collect_timings=True),
+        )
 
     if cfg.profiling.memory_profiling.enable and is_cuda:
         torch.cuda.memory._dump_snapshot(str(memory_profile_output_path))
@@ -180,8 +164,16 @@ def main(cfg: DictConfig) -> None:
     )
     LOGGER.info(header)
     LOGGER.info("-" * len(header))
-    for stage in ("forward", "backward", "optimizer_step", "total"):
-        samples = timings[stage]
+    stage_order = (
+        "forward",
+        "forward_phase",
+        "backward",
+        "backward_phase",
+        "optimizer_step",
+        "total",
+    )
+    for stage in stage_order:
+        samples = timings.get(stage, [])
         if not samples:
             continue
         values = np.array(samples)
