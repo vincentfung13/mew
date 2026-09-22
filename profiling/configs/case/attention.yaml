@@ -1,0 +1,10 @@
+name: attention
+
+batch_size: 4
+seq_len: 256
+
+d_model: 768
+num_heads: 12
+num_groups: null
+rope_theta: 10000.0
+max_seq_len: ${case.seq_len}

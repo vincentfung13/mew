@@ -1,0 +1,4 @@
+interface:
+  display_name: "PyTorch Memory Report"
+  short_description: "Visualize and interpret PyTorch memory traces"
+  default_prompt: "Use $pytorch-memory-report to turn this PyTorch CUDA memory snapshot into an interactive HTML report and explain the main optimization opportunities."
