@@ -35,6 +35,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
     query_tile_ind = tl.program_id(0)
     batch_ind = tl.program_id(1)
@@ -90,6 +91,10 @@ def flash_fwd_kernel(
 
     # Load q tile
     Q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
+    Q_offsets = query_tile_ind * Q_TILE_SIZE + tl.arange(
+        0, Q_TILE_SIZE
+    )  # (Q_TILE_SIZE,)
+    Q_is_valid = Q_offsets[:, None] < N_QUERIES
 
     # Load K, V tile by tile
     for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
@@ -100,15 +105,33 @@ def flash_fwd_kernel(
         V_j = tl.load(
             V_block_ptr, boundary_check=(0,), padding_option="zero"
         )  # (K_TILE_SIZE, D)
+        K_offsets = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)  # (K_TILE_SIZE, )
+        K_is_valid = K_offsets[None, :] < N_KEYS
 
         # Compute dot product
         S_ij = tl.dot(Q, tl.trans(K_j)) / scale  # (Q_TILE_SIZE, K_TILE_SIZE)
 
+        # To handle partial tile, each (q_ind, k_ind/v_ind) is valid
+        QK_is_valid = Q_is_valid & K_is_valid
+
+        if IS_CAUSAL:
+            # Upper triangular mask
+            mask = (
+                Q_offsets[:, None] >= K_offsets[None, :]
+            )  # (Q_TILE_SIZE, K_TILE_SIZE)
+            # Apply causal mask
+            S_ij = tl.where(mask & QK_is_valid, S_ij, -1e6)
+        else:
+            S_ij = tl.where(QK_is_valid, S_ij, -1e6)
+
         # Compute local max, calibrate prev results
         _M = tl.maximum(M, tl.max(S_ij, axis=1))
 
+        # Normalize by local max logits
+        S_ij -= _M[:, None]  # (Q_TILE_SIZE, K_TILE_SIZE)
+
         # compute and aggregate exp sum (for backward)
-        P_ij = tl.exp(S_ij - _M[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+        P_ij = tl.exp(S_ij)  # (Q_TILE_SIZE, K_TILE_SIZE)
         M_calibration = tl.exp(M - _M)
         L = M_calibration * L + tl.sum(P_ij, axis=1)
 
@@ -128,5 +151,5 @@ def flash_fwd_kernel(
     # Store log sum for backward
     L = M + tl.log(L)
 
-    tl.store(O_block_ptr, O_acc)
-    tl.store(L_block_ptr, L)
+    tl.store(O_block_ptr, O_acc, boundary_check=(0,))
+    tl.store(L_block_ptr, L, boundary_check=(0,))

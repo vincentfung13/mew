@@ -51,7 +51,9 @@ class FlashAttention(torch.autograd.Function):
             D=d,
             Q_TILE_SIZE=cfg["Q_TILE_SIZE"],
             K_TILE_SIZE=cfg["K_TILE_SIZE"],
+            IS_CAUSAL=is_causal,
         )
+        ctx.is_causal = is_causal
         ctx.save_for_backward(L, Q, K, V, O_acc)
         return O_acc
 
