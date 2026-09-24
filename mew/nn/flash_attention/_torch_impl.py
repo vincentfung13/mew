@@ -29,14 +29,14 @@ class FlashAttentionTorchImpl(torch.autograd.Function):
         num_blk_kv = math.ceil(n_kv / TILE_SIZE_KV)
 
         # output buffer
-        O = torch.empty_like(Q)
+        O_acc = torch.empty_like(Q)
         L = torch.empty((batch, n_q))
 
         for i in range(num_blk_q):
             # Load Q_i
             head_q = i * TILE_SIZE_Q
             tail_q = min(n_q, (i + 1) * TILE_SIZE_Q)
-            Q_i = Q[:, head_q:tail_q]    # (batch, TILE_SIZE_Q, d)
+            Q_i = Q[:, head_q:tail_q]  # (batch, TILE_SIZE_Q, d)
             O_i = torch.empty_like(Q_i)  # (batch, TILE_SIZE_Q, d)
             l_i = torch.zeros((batch, min(tail_q - head_q, TILE_SIZE_Q)))
             m_i = torch.full((batch, min(tail_q - head_q, TILE_SIZE_Q)), float("-inf"))
@@ -76,15 +76,15 @@ class FlashAttentionTorchImpl(torch.autograd.Function):
                 m_i = _new_max
 
             # Normalize O_i, l_i and write to O, L
-            O[:, head_q:tail_q] = O_i / l_i[:, :, None]
+            O_acc[:, head_q:tail_q] = O_i / l_i[:, :, None]
 
             # -logits.max only works if we're normalizing with full softmax,
             # to cal the real log exp sum for backward, we need to add back m_i
             L[:, head_q:tail_q] = m_i + l_i.log()
 
-        ctx.save_for_backward(L, Q, K, V, O)
+        ctx.save_for_backward(L, Q, K, V, O_acc)
 
-        return O
+        return O_acc
 
     @staticmethod
     def backward(ctx):

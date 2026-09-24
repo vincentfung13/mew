@@ -78,14 +78,14 @@ def flash_fwd_kernel(
         L_ptr + batch_ind * stride_lb,
         shape=(N_QUERIES,),
         strides=(stride_lq,),
-        offsets=(0),
+        offsets=(query_tile_ind * Q_TILE_SIZE,),
         block_shape=(Q_TILE_SIZE,),
         order=(0,),
     )
 
     # Init running max/log_exp_sum/output/log_exp_sum tensor
     M = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32)
-    O = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    O_acc = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
     L = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
 
     # Load q tile
@@ -105,21 +105,28 @@ def flash_fwd_kernel(
         S_ij = tl.dot(Q, tl.trans(K_j)) / scale  # (Q_TILE_SIZE, K_TILE_SIZE)
 
         # Compute local max, calibrate prev results
-        _M = tl.maximum(M, tl.max(S_ij, axis=-1))
+        _M = tl.maximum(M, tl.max(S_ij, axis=1))
 
         # compute and aggregate exp sum (for backward)
-        P_ij = tl.exp(S_ij - _M)  # (Q_TILE_SIZE, K_TILE_SIZE)
-        L = tl.exp(M - _M) * L + tl.sum(P_ij)
+        P_ij = tl.exp(S_ij - _M[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+        M_calibration = tl.exp(M - _M)
+        L = M_calibration * L + tl.sum(P_ij, axis=1)
 
         # compute, aggregate, calibrate output
-        O = tl.exp(M - _M) * tl.dot(P_ij, V_j)
+        O_acc = M_calibration[:, None] * O_acc + tl.dot(P_ij, V_j)
 
         # assign new max
         M = _M
 
         # Advance kv pointer
-        K_block_ptr.advance((K_TILE_SIZE, 0))
-        V_block_ptr.advance((K_TILE_SIZE, 0))
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
 
-    tl.store(O_block_ptr, O)
+    # Softmax normalization
+    O_acc /= L[:, None]
+
+    # Store log sum for backward
+    L = M + tl.log(L)
+
+    tl.store(O_block_ptr, O_acc)
     tl.store(L_block_ptr, L)
