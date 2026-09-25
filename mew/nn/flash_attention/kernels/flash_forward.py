@@ -148,7 +148,10 @@ def flash_fwd_kernel(
     # Softmax normalization
     O_acc /= L[:, None]
 
-    # Store log sum for backward
+    # Store log sum + row_max for backward
+    # rationale of this logsum trick: when we recompute softmax in backward, we do:
+    #   exp(S_ij - M_i - log(L))
+    # whic automatically reduces to exp(S_ij - M_i) / L
     L = M + tl.log(L)
 
     tl.store(O_block_ptr, O_acc, boundary_check=(0,))
