@@ -55,7 +55,7 @@ def flash_bwd_kernel_dkv(
         shape=(N_QUERIES, dim),
         strides=(stride_qq, stride_qd),
         # always load from the first position from:
-        # Q_ptr + query_tile_ind * batch_ind
+        # Q_ptr + batch_ind * stride_qb
         offsets=(0, 0),
         block_shape=(Q_TILE_SIZE, dim),
         order=(1, 0),
@@ -97,7 +97,7 @@ def flash_bwd_kernel_dkv(
         shape=(N_QUERIES, dim),
         strides=(stride_doq, stride_dod),
         # always load from the first position from:
-        # Q_ptr + query_tile_ind * batch_ind
+        # dO_ptr + batch_ind * stride_dob
         offsets=(0, 0),
         block_shape=(Q_TILE_SIZE, dim),
         order=(1, 0),
@@ -128,6 +128,8 @@ def flash_bwd_kernel_dkv(
     V_j = tl.load(
         V_block_ptr, boundary_check=(0,), padding_option="zero"
     )  # (K_TILE_SIZE, dim)
+    K_offsets = kv_tile_ind * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)  # (K_TILE_SIZE,)
+    K_is_valid = K_offsets[None, :] < N_KEYS
 
     # Init buffer for output
     dK_j = tl.zeros((K_TILE_SIZE, dim), dtype=tl.float32)
@@ -147,9 +149,22 @@ def flash_bwd_kernel_dkv(
         dO_i = tl.load(
             dO_block_ptr, boundary_check=(0,), padding_option="zero"
         )  # (Q_TILE_SIZE, dim)
+        Q_offsets = i * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)  # (Q_TILE_SIZE, )
+        Q_is_valid = Q_offsets[:, None] < N_QUERIES
+
+        # To handle partial tile, each (q_ind, k_ind/v_ind) is valid
+        QK_is_valid = Q_is_valid & K_is_valid
 
         # Recompute S_i and P_i
         S_ij = tl.dot(Q_i, tl.trans(K_j)) / scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        if IS_CAUSAL:
+            # Upper triangular causal mask
+            mask = (
+                Q_offsets[:, None] >= K_offsets[None, :]
+            )  # (Q_TILE_SIZE, K_TILE_SIZE)
+            S_ij = tl.where(mask & QK_is_valid, S_ij, -1e6)
+        else:
+            S_ij = tl.where(QK_is_valid, S_ij, -1e6)
         P_ij = tl.exp(S_ij - L_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
 
         # Compute and aggregate dV_j
@@ -289,6 +304,10 @@ def flash_bwd_kernel_dq(
     dO_i = tl.load(
         dO_block_ptr, boundary_check=(0,), padding_option="zero"
     )  # (Q_TILE_SIZE, dim)
+    Q_offsets = query_tile_ind * Q_TILE_SIZE + tl.arange(
+        0, Q_TILE_SIZE
+    )  # (Q_TILE_SIZE,)
+    Q_is_valid = Q_offsets[:, None] < N_QUERIES
 
     # Init buffer for output
     dQ_i = tl.zeros((Q_TILE_SIZE, dim), dtype=tl.float32)
@@ -302,9 +321,21 @@ def flash_bwd_kernel_dq(
         V_j = tl.load(
             V_block_ptr, boundary_check=(0,), padding_option="zero"
         )  # (K_TILE_SIZE, dim)
+        K_offsets = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)  # (K_TILE_SIZE, )
+        K_is_valid = K_offsets[None, :] < N_KEYS
+        # To handle partial tile, each (q_ind, k_ind/v_ind) is valid
+        QK_is_valid = Q_is_valid & K_is_valid
 
         # Recompute S_i and P_i
         S_ij = tl.dot(Q_i, tl.trans(K_j)) / scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        if IS_CAUSAL:
+            # Upper triangular causal mask
+            mask = (
+                Q_offsets[:, None] >= K_offsets[None, :]
+            )  # (Q_TILE_SIZE, K_TILE_SIZE)
+            S_ij = tl.where(mask & QK_is_valid, S_ij, -1e6)
+        else:
+            S_ij = tl.where(QK_is_valid, S_ij, -1e6)
         P_ij = tl.exp(S_ij - L_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
 
         # Compute Jacobian dP_ij and then dS_ij

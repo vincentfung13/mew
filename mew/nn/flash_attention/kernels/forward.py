@@ -108,11 +108,11 @@ def flash_fwd_kernel(
         K_offsets = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)  # (K_TILE_SIZE, )
         K_is_valid = K_offsets[None, :] < N_KEYS
 
-        # Compute dot product
-        S_ij = tl.dot(Q, tl.trans(K_j)) / scale  # (Q_TILE_SIZE, K_TILE_SIZE)
-
         # To handle partial tile, each (q_ind, k_ind/v_ind) is valid
         QK_is_valid = Q_is_valid & K_is_valid
+
+        # Compute dot product
+        S_ij = tl.dot(Q, tl.trans(K_j)) / scale  # (Q_TILE_SIZE, K_TILE_SIZE)
 
         if IS_CAUSAL:
             # Upper triangular mask
