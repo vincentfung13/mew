@@ -32,7 +32,7 @@ def flash_fwd_kernel(
     N_QUERIES,
     N_KEYS,
     scale,
-    D: tl.constexpr,
+    dim: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
@@ -43,36 +43,36 @@ def flash_fwd_kernel(
     # Init input blk ptrs
     Q_block_ptr = tl.make_block_ptr(
         Q_ptr + batch_ind * stride_qb,
-        shape=(N_QUERIES, D),
+        shape=(N_QUERIES, dim),
         strides=(stride_qq, stride_qd),
         offsets=(query_tile_ind * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, D),
+        block_shape=(Q_TILE_SIZE, dim),
         order=(1, 0),
     )
     K_block_ptr = tl.make_block_ptr(
         K_ptr + batch_ind * stride_kb,
-        shape=(N_KEYS, D),
+        shape=(N_KEYS, dim),
         strides=(stride_kq, stride_kd),
         offsets=(0, 0),
-        block_shape=(K_TILE_SIZE, D),
+        block_shape=(K_TILE_SIZE, dim),
         order=(1, 0),
     )
     V_block_ptr = tl.make_block_ptr(
         V_ptr + batch_ind * stride_vb,
-        shape=(N_KEYS, D),
+        shape=(N_KEYS, dim),
         strides=(stride_vq, stride_vd),
         offsets=(0, 0),
-        block_shape=(K_TILE_SIZE, D),
+        block_shape=(K_TILE_SIZE, dim),
         order=(1, 0),
     )
 
     # Init output buffer ptrs
     O_block_ptr = tl.make_block_ptr(
         O_ptr + batch_ind * stride_ob,
-        shape=(N_QUERIES, D),
+        shape=(N_QUERIES, dim),
         strides=(stride_oq, stride_od),
         offsets=(query_tile_ind * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, D),
+        block_shape=(Q_TILE_SIZE, dim),
         order=(1, 0),
     )
     L_block_ptr = tl.make_block_ptr(
@@ -86,7 +86,7 @@ def flash_fwd_kernel(
 
     # Init running max/log_exp_sum/output/log_exp_sum tensor
     M = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32)
-    O_acc = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    O_acc = tl.zeros((Q_TILE_SIZE, dim), dtype=tl.float32)
     L = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
 
     # Load q tile
@@ -101,10 +101,10 @@ def flash_fwd_kernel(
         # Load the i_th tile (no need for boundary check on the 1st dim)
         K_j = tl.load(
             K_block_ptr, boundary_check=(0,), padding_option="zero"
-        )  # (K_TILE_SIZE, D)
+        )  # (K_TILE_SIZE, dim)
         V_j = tl.load(
             V_block_ptr, boundary_check=(0,), padding_option="zero"
-        )  # (K_TILE_SIZE, D)
+        )  # (K_TILE_SIZE, dim)
         K_offsets = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)  # (K_TILE_SIZE, )
         K_is_valid = K_offsets[None, :] < N_KEYS
 
