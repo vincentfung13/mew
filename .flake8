@@ -2,7 +2,8 @@
 # E501: line length, not enforced by this project.
 # E203, W503: black formats slices/line breaks in ways that conflict with these checks.
 # F722: false positive on jaxtyping's runtime shape annotations (e.g. Float[Tensor, "... d_model"]).
-ignore = E501,E203,W503,F722
+# E741: single-letter math names (O, l, I) are standard in attention/linear-algebra code.
+ignore = E501,E203,W503,F722,E741
 exclude = 
     .venv,
     __pycache__,

@@ -70,7 +70,7 @@ def _build_attention_case(cfg: DictConfig, device: str) -> ProfilingCase:
         max_seq_len=cfg.case.max_seq_len,
         device=device,
         num_groups=cfg.case.num_groups,
-    )
+    ).to(device)
     return ProfilingCase(
         module=module,
         inputs=(_activation_input(cfg, device),),
@@ -92,7 +92,7 @@ def _build_ffn_case(cfg: DictConfig, device: str) -> ProfilingCase:
         d_model=cfg.case.d_model,
         d_ff=cfg.case.d_ff,
         device=device,
-    )
+    ).to(device)
     return ProfilingCase(
         module=module,
         inputs=(_activation_input(cfg, device),),

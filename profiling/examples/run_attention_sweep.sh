@@ -10,12 +10,12 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "${SCRIPT_DIR}/profiling_common.sh"
 
-D_MODELS=(16 32 64 128)
-SEQ_LENS=(256 1024 4096 8192 16384)
+D_MODELS=(64 128)
+SEQ_LENS=(4096 8192 16384)
 NUM_HEADS=1
 BATCH_SIZE=8
 
-AMP_ENABLES=(true false)
+AMP_ENABLES=(false)
 PROTOCOLS=(
     repeat_backward_on_same_graph
 )
@@ -30,7 +30,8 @@ for d_model in "${D_MODELS[@]}"; do
             case.seq_len="$seq_len" \
             case.d_model="$d_model" \
             case.num_heads="$NUM_HEADS" \
-            case.num_groups=null
+            case.num_groups=null \
+            profiling.exec_steps=100
     done
 done
 
