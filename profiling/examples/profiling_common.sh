@@ -70,7 +70,7 @@ run_profiling() {
             --capture-range-end=stop \
             --output="$report_path" \
             --force-overwrite=true \
-            -- python -m profiling.run \
+            -- python -m profiling.profile_module \
             case="$target" \
             "${case_overrides[@]}" \
             profiling.nvtx.annotate_modules=true \
@@ -83,7 +83,7 @@ run_profiling() {
             amp.enable="$amp_enable" \
             amp.dtype="$amp_dtype"
     else
-        uv run python -m profiling.run \
+        uv run python -m profiling.profile_module \
             case="$target" \
             "${case_overrides[@]}" \
             profiling.nvtx.annotate_modules=true \

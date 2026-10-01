@@ -1,0 +1,33 @@
+defaults:
+  - function: attention
+  - _self_
+
+device: cuda
+# fp32, fp16, or bf16. Inputs are created in this dtype; no autocast is applied.
+dtype: fp32
+
+bench:
+  output_dir: benchmarks/default
+  # fwd, bwd, or fwd_bwd
+  mode: fwd
+  # ms or tflops
+  metric: ms
+  # do_bench budgets, in milliseconds of runtime (not iterations).
+  warmup_ms: 25
+  rep_ms: 100
+  providers:
+    - flash_triton
+    - reference
+    - torch_sdpa
+  # Compare each provider's forward output to the reference before timing it.
+  check_correctness: true
+  reference_provider: reference
+  sweep:
+    # Any parameter of the selected function config, e.g. seq_len or d_head.
+    x_name: seq_len
+    x_vals: [256, 512, 1024, 2048, 4096]
+    x_log: true
+
+hydra:
+  run:
+    dir: ${bench.output_dir}

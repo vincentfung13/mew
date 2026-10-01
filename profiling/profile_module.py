@@ -36,7 +36,7 @@ def _attach_nvtx_hooks(
     return handles
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="profiling")
+@hydra.main(version_base=None, config_path="configs", config_name="profile_module")
 def main(cfg: DictConfig) -> None:
     is_cuda = cfg.device == "cuda"
     output_dir = Path(cfg.profiling.output_dir)
