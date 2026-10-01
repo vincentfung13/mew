@@ -24,8 +24,11 @@ class FlashAttention(torch.autograd.Function):
         scale = math.sqrt(d)
         assert torch.cuda.is_available()
 
-        # Init output buffer
-        O_acc = torch.empty_like(Q, dtype=torch.float32, device="cuda")
+        # Init output buffer:
+        # O should match the dtype of Q (avoid fp16 <-> fp32 mismatch);
+        # L always needs to be fp32, because backward uses it as an exponent offset in exp(S - L)
+        # where a rounding error in L turns into a relative error in every recomputed probability.
+        O = torch.empty_like(Q, device="cuda")
         L = torch.empty((batch, n_q_heads, n_q), dtype=torch.float32, device="cuda")
 
         # Launch triton kernel (launch grid is [n_queries, batch * n_q_heads])
@@ -33,7 +36,7 @@ class FlashAttention(torch.autograd.Function):
             Q,
             K,
             V,
-            O_acc,
+            O,
             L,
             Q.stride(0),
             Q.stride(1),
@@ -47,10 +50,10 @@ class FlashAttention(torch.autograd.Function):
             V.stride(1),
             V.stride(2),
             V.stride(3),
-            O_acc.stride(0),
-            O_acc.stride(1),
-            O_acc.stride(2),
-            O_acc.stride(3),
+            O.stride(0),
+            O.stride(1),
+            O.stride(2),
+            O.stride(3),
             L.stride(0),
             L.stride(1),
             L.stride(2),
@@ -69,9 +72,9 @@ class FlashAttention(torch.autograd.Function):
         ctx.scale = scale
         ctx.Q_TILE_SIZE = cfg["Q_TILE_SIZE"]
         ctx.K_TILE_SIZE = cfg["K_TILE_SIZE"]
-        ctx.save_for_backward(L, Q, K, V, O_acc)
+        ctx.save_for_backward(L, Q, K, V, O)
 
-        return O_acc
+        return O
 
     @staticmethod
     def backward(ctx, dO: torch.Tensor):
@@ -82,13 +85,13 @@ class FlashAttention(torch.autograd.Function):
         scale = ctx.scale
 
         # Init result pointers
-        dQ = torch.zeros_like(Q, dtype=torch.float32, device="cuda")
-        dK = torch.zeros_like(K, dtype=torch.float32, device="cuda")
-        dV = torch.zeros_like(V, dtype=torch.float32, device="cuda")
+        dQ = torch.empty_like(Q, device="cuda")
+        dK = torch.empty_like(K, device="cuda")
+        dV = torch.empty_like(V, device="cuda")
 
         # Pre-compute row sum for dO to simplify softmax grad
         # dO -> (batch, n_q_heads, n_q, dim)
-        D = (O * dO).sum(axis=-1)
+        D = (O.float() * dO).sum(axis=-1)
 
         # Launch triton kernels - two outer loops
         flash_bwd_kernel_dq[(triton.cdiv(n_q, ctx.Q_TILE_SIZE), batch * n_q_heads)](

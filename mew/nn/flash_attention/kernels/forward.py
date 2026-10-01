@@ -150,7 +150,7 @@ def flash_fwd_kernel(
         L = M_calibration * L + tl.sum(P_ij, axis=1)
 
         # compute, aggregate, calibrate output
-        O_acc = M_calibration[:, None] * O_acc + tl.dot(P_ij, V_j)
+        O_acc = M_calibration[:, None] * O_acc + tl.dot(P_ij.to(V_j.dtype), V_j)
 
         # assign new max
         M = _M
@@ -168,5 +168,5 @@ def flash_fwd_kernel(
     # whic automatically reduces to exp(S_ij - M_i) / L
     L = M + tl.log(L)
 
-    tl.store(O_block_ptr, O_acc, boundary_check=(0,))
+    tl.store(O_block_ptr, O_acc.to(O_ptr.dtype.element_ty), boundary_check=(0,))
     tl.store(L_block_ptr, L, boundary_check=(0,))

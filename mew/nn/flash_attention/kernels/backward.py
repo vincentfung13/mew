@@ -180,12 +180,14 @@ def flash_bwd_kernel_dkv(
             P_ij = tl.exp(S_ij - L_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
 
             # Compute and aggregate dV_j
-            dV_j += tl.dot(tl.trans(P_ij), dO_i)  # (K_TILE_SIZE, dim)
+            dV_j += tl.dot(tl.trans(P_ij).to(dO_i.dtype), dO_i)  # (K_TILE_SIZE, dim)
 
             # Compute Jacobian dP_ij and then dS_ij
             dP_ij = tl.dot(dO_i, tl.trans(V_j))  # (Q_TILE_SIZE, K_TILE_SIZE)
             dS_ij = P_ij * (dP_ij - D_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
-            dK_j += tl.dot(tl.trans(dS_ij), Q_i) / scale  # (K_TILE_SIZE, dim)
+            dK_j += (
+                tl.dot(tl.trans(dS_ij).to(Q_i.dtype), Q_i) / scale
+            )  # (K_TILE_SIZE, dim)
 
             # Advance the pointers
             Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
@@ -194,8 +196,8 @@ def flash_bwd_kernel_dkv(
             dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
 
     # Save dK_j and dV_j to buffer
-    tl.store(dK_block_ptr, dK_j, boundary_check=(0,))
-    tl.store(dV_block_ptr, dV_j, boundary_check=(0,))
+    tl.store(dK_block_ptr, dK_j.to(dK_ptr.dtype.element_ty), boundary_check=(0,))
+    tl.store(dV_block_ptr, dV_j.to(dV_ptr.dtype.element_ty), boundary_check=(0,))
 
 
 @triton.jit
@@ -368,10 +370,10 @@ def flash_bwd_kernel_dq(
         # Compute Jacobian dP_ij and then dS_ij
         dP_ij = tl.dot(dO_i, tl.trans(V_j))  # (Q_TILE_SIZE, K_TILE_SIZE)
         dS_ij = P_ij * (dP_ij - D_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
-        dQ_i += tl.dot(dS_ij, K_j) / scale  # (Q_TILE_SIZE, dim)
+        dQ_i += tl.dot(dS_ij.to(K_j.dtype), K_j) / scale  # (Q_TILE_SIZE, dim)
 
         # Advance block ptrs
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
 
-    tl.store(dQ_block_ptr, dQ_i, boundary_check=(0,))
+    tl.store(dQ_block_ptr, dQ_i.to(dQ_ptr.dtype.element_ty), boundary_check=(0,))
