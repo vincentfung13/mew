@@ -5,9 +5,9 @@ import triton.language as tl
 @triton.jit
 def flash_fwd_kernel(
     # pointers to:
-    # Q -> (batch, n_q, d)
-    # K -> (batch, n_kv, d)
-    # V -> (batch, n_kv, d)
+    # Q -> (batch, n_q_heads, n_q, d)
+    # K -> (batch, n_kv_heads, n_kv, d)
+    # V -> (batch, n_kv_heads, n_kv, d)
     Q_ptr,
     K_ptr,
     V_ptr,
@@ -16,21 +16,28 @@ def flash_fwd_kernel(
     O_ptr,
     L_ptr,
     stride_qb,
+    stride_qh,
     stride_qq,
     stride_qd,
     stride_kb,
+    stride_kh,
     stride_kq,
     stride_kd,
     stride_vb,
+    stride_vh,
     stride_vq,
     stride_vd,
     stride_ob,
+    stride_oh,
     stride_oq,
     stride_od,
     stride_lb,
+    stride_lh,
     stride_lq,
     N_QUERIES,
     N_KEYS,
+    N_Q_HEADS,
+    N_KV_HEADS,
     scale,
     dim: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
@@ -38,11 +45,18 @@ def flash_fwd_kernel(
     IS_CAUSAL: tl.constexpr,
 ):
     query_tile_ind = tl.program_id(0)
-    batch_ind = tl.program_id(1)
+    batch_head_ind = tl.program_id(1)
+
+    # Compute inds for q
+    batch_ind = batch_head_ind // N_Q_HEADS
+    head_ind_q = batch_head_ind % N_Q_HEADS
+
+    # Compute head ind for kv (for non-GQA, head_ind_q == head_ind_kv)
+    head_ind_kv = head_ind_q // (N_Q_HEADS // N_KV_HEADS)
 
     # Init input blk ptrs
     Q_block_ptr = tl.make_block_ptr(
-        Q_ptr + batch_ind * stride_qb,
+        Q_ptr + batch_ind * stride_qb + head_ind_q * stride_qh,
         shape=(N_QUERIES, dim),
         strides=(stride_qq, stride_qd),
         offsets=(query_tile_ind * Q_TILE_SIZE, 0),
@@ -50,7 +64,7 @@ def flash_fwd_kernel(
         order=(1, 0),
     )
     K_block_ptr = tl.make_block_ptr(
-        K_ptr + batch_ind * stride_kb,
+        K_ptr + batch_ind * stride_kb + head_ind_kv * stride_kh,
         shape=(N_KEYS, dim),
         strides=(stride_kq, stride_kd),
         offsets=(0, 0),
@@ -58,7 +72,7 @@ def flash_fwd_kernel(
         order=(1, 0),
     )
     V_block_ptr = tl.make_block_ptr(
-        V_ptr + batch_ind * stride_vb,
+        V_ptr + batch_ind * stride_vb + head_ind_kv * stride_vh,
         shape=(N_KEYS, dim),
         strides=(stride_vq, stride_vd),
         offsets=(0, 0),
@@ -68,7 +82,7 @@ def flash_fwd_kernel(
 
     # Init output buffer ptrs
     O_block_ptr = tl.make_block_ptr(
-        O_ptr + batch_ind * stride_ob,
+        O_ptr + batch_ind * stride_ob + head_ind_q * stride_oh,
         shape=(N_QUERIES, dim),
         strides=(stride_oq, stride_od),
         offsets=(query_tile_ind * Q_TILE_SIZE, 0),
@@ -76,7 +90,7 @@ def flash_fwd_kernel(
         order=(1, 0),
     )
     L_block_ptr = tl.make_block_ptr(
-        L_ptr + batch_ind * stride_lb,
+        L_ptr + batch_ind * stride_lb + head_ind_q * stride_lh,
         shape=(N_QUERIES,),
         strides=(stride_lq,),
         offsets=(query_tile_ind * Q_TILE_SIZE,),
