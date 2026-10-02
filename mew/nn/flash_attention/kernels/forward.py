@@ -7,7 +7,7 @@ import triton.language as tl
         triton.Config({"Q_TILE_SIZE": bq, "K_TILE_SIZE": bk}, num_stages=s, num_warps=w)
         for bq in (64, 128)
         for bk in (64, 128)
-        for s in (1, 2, 4)
+        for s in (2, 4)
         for w in (4, 8)
     ],
     key=["N_QUERIES", "N_KEYS", "dim", "IS_CAUSAL", "N_Q_HEADS", "N_KV_HEADS"],
@@ -48,7 +48,7 @@ def flash_fwd_kernel(
     N_KEYS: tl.constexpr,
     N_Q_HEADS: tl.constexpr,
     N_KV_HEADS: tl.constexpr,
-    scale,
+    qk_scale: tl.constexpr,
     dim: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
@@ -113,12 +113,14 @@ def flash_fwd_kernel(
     )
 
     # Init running max/log_exp_sum/output/log_exp_sum tensor
+    # note: L is of base 2
     M = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32)
     O_acc = tl.zeros((Q_TILE_SIZE, dim), dtype=tl.float32)
     L = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
 
     # Load q tile
     Q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
+
     Q_offsets = query_tile_ind * Q_TILE_SIZE + tl.arange(
         0, Q_TILE_SIZE
     )  # (Q_TILE_SIZE,)
@@ -148,7 +150,9 @@ def flash_fwd_kernel(
         QK_is_valid = Q_is_valid & K_is_valid
 
         # Compute dot product
-        S_ij = tl.dot(Q, tl.trans(K_j)) / scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        # NOTE: qk_scale is applied when we compute max and -max
+        # so ops can be fused by the compiler
+        S_ij = tl.dot(Q, tl.trans(K_j))  # (Q_TILE_SIZE, K_TILE_SIZE)
 
         if IS_CAUSAL:
             # Upper triangular mask
@@ -161,14 +165,14 @@ def flash_fwd_kernel(
             S_ij = tl.where(QK_is_valid, S_ij, -1e6)
 
         # Compute local max, calibrate prev results
-        _M = tl.maximum(M, tl.max(S_ij, axis=1))
+        _M = tl.maximum(M, tl.max(S_ij, axis=1) * qk_scale)
 
         # Normalize by local max logits
-        S_ij -= _M[:, None]  # (Q_TILE_SIZE, K_TILE_SIZE)
+        S_ij = S_ij * qk_scale - _M[:, None]  # (Q_TILE_SIZE, K_TILE_SIZE)
 
         # compute and aggregate exp sum (for backward)
-        P_ij = tl.exp(S_ij)  # (Q_TILE_SIZE, K_TILE_SIZE)
-        M_calibration = tl.exp(M - _M)
+        P_ij = tl.math.exp2(S_ij)  # (Q_TILE_SIZE, K_TILE_SIZE)
+        M_calibration = tl.math.exp2(M - _M)
         L = M_calibration * L + tl.sum(P_ij, axis=1)
 
         # compute, aggregate, calibrate output
@@ -186,9 +190,10 @@ def flash_fwd_kernel(
 
     # Store log sum + row_max for backward
     # rationale of this logsum trick: when we recompute softmax in backward, we do:
-    #   exp(S_ij - M_i - log(L))
+    #   exp2(S_ij - M_i - log(L))
     # which automatically reduces to exp(S_ij - M_i) / L
-    L = M + tl.log(L)
+    # Note: L is of base 2 instead of e
+    L = M + tl.log2(L)
 
     tl.store(O_block_ptr, O_acc.to(O_ptr.dtype.element_ty), boundary_check=(0,))
     tl.store(L_block_ptr, L, boundary_check=(0,))

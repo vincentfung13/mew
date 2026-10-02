@@ -7,7 +7,7 @@ import triton.language as tl
         triton.Config({"Q_TILE_SIZE": bq, "K_TILE_SIZE": bk}, num_stages=s, num_warps=w)
         for bq in (64, 128)
         for bk in (64, 128)
-        for s in (1, 2, 4)
+        for s in (2, 4)
         for w in (4, 8)
     ],
     key=["N_QUERIES", "N_KEYS", "dim", "IS_CAUSAL", "N_Q_HEADS", "N_KV_HEADS"],
@@ -60,7 +60,8 @@ def flash_bwd_kernel_dkv(
     N_KEYS,
     N_Q_HEADS,
     N_KV_HEADS,
-    scale,
+    qk_scale: tl.constexpr,
+    sm_scale: tl.constexpr,
     dim: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
@@ -185,7 +186,7 @@ def flash_bwd_kernel_dkv(
             QK_is_valid = Q_is_valid & K_is_valid
 
             # Recompute S_i and P_i
-            S_ij = tl.dot(Q_i, tl.trans(K_j)) / scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+            S_ij = tl.dot(Q_i, tl.trans(K_j))  # (Q_TILE_SIZE, K_TILE_SIZE)
             if IS_CAUSAL:
                 # Upper triangular causal mask
                 mask = (
@@ -194,7 +195,7 @@ def flash_bwd_kernel_dkv(
                 S_ij = tl.where(mask & QK_is_valid, S_ij, -1e6)
             else:
                 S_ij = tl.where(QK_is_valid, S_ij, -1e6)
-            P_ij = tl.exp(S_ij - L_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+            P_ij = tl.exp2(S_ij * qk_scale - L_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
 
             # Compute and aggregate dV_j
             dV_j += tl.dot(tl.trans(P_ij).to(dO_i.dtype), dO_i)  # (K_TILE_SIZE, dim)
@@ -202,9 +203,7 @@ def flash_bwd_kernel_dkv(
             # Compute Jacobian dP_ij and then dS_ij
             dP_ij = tl.dot(dO_i, tl.trans(V_j))  # (Q_TILE_SIZE, K_TILE_SIZE)
             dS_ij = P_ij * (dP_ij - D_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
-            dK_j += (
-                tl.dot(tl.trans(dS_ij).to(Q_i.dtype), Q_i) / scale
-            )  # (K_TILE_SIZE, dim)
+            dK_j += tl.dot(tl.trans(dS_ij).to(Q_i.dtype), Q_i)  # (K_TILE_SIZE, dim)
 
             # Advance the pointers
             Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
@@ -213,7 +212,9 @@ def flash_bwd_kernel_dkv(
             dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
 
     # Save dK_j and dV_j to buffer
-    tl.store(dK_block_ptr, dK_j.to(dK_ptr.dtype.element_ty), boundary_check=(0,))
+    tl.store(
+        dK_block_ptr, (dK_j * sm_scale).to(dK_ptr.dtype.element_ty), boundary_check=(0,)
+    )
     tl.store(dV_block_ptr, dV_j.to(dV_ptr.dtype.element_ty), boundary_check=(0,))
 
 
@@ -222,7 +223,7 @@ def flash_bwd_kernel_dkv(
         triton.Config({"Q_TILE_SIZE": bq, "K_TILE_SIZE": bk}, num_stages=s, num_warps=w)
         for bq in (64, 128)
         for bk in (64, 128)
-        for s in (1, 2, 4)
+        for s in (2, 4)
         for w in (4, 8)
     ],
     key=["N_QUERIES", "N_KEYS", "dim", "IS_CAUSAL", "N_Q_HEADS", "N_KV_HEADS"],
@@ -273,7 +274,8 @@ def flash_bwd_kernel_dq(
     N_KEYS,
     N_Q_HEADS,
     N_KV_HEADS,
-    scale,
+    qk_scale: tl.constexpr,
+    sm_scale: tl.constexpr,
     dim: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
@@ -392,7 +394,7 @@ def flash_bwd_kernel_dq(
         QK_is_valid = Q_is_valid & K_is_valid
 
         # Recompute S_i and P_i
-        S_ij = tl.dot(Q_i, tl.trans(K_j)) / scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        S_ij = tl.dot(Q_i, tl.trans(K_j))  # (Q_TILE_SIZE, K_TILE_SIZE)
         if IS_CAUSAL:
             # Upper triangular causal mask
             mask = (
@@ -401,15 +403,17 @@ def flash_bwd_kernel_dq(
             S_ij = tl.where(mask & QK_is_valid, S_ij, -1e6)
         else:
             S_ij = tl.where(QK_is_valid, S_ij, -1e6)
-        P_ij = tl.exp(S_ij - L_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+        P_ij = tl.exp2(S_ij * qk_scale - L_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
 
         # Compute Jacobian dP_ij and then dS_ij
         dP_ij = tl.dot(dO_i, tl.trans(V_j))  # (Q_TILE_SIZE, K_TILE_SIZE)
         dS_ij = P_ij * (dP_ij - D_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
-        dQ_i += tl.dot(dS_ij.to(K_j.dtype), K_j) / scale  # (Q_TILE_SIZE, dim)
+        dQ_i += tl.dot(dS_ij.to(K_j.dtype), K_j)  # (Q_TILE_SIZE, dim)
 
         # Advance block ptrs
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
 
-    tl.store(dQ_block_ptr, dQ_i.to(dQ_ptr.dtype.element_ty), boundary_check=(0,))
+    tl.store(
+        dQ_block_ptr, (dQ_i * sm_scale).to(dQ_ptr.dtype.element_ty), boundary_check=(0,)
+    )

@@ -20,7 +20,10 @@ class FlashAttention(torch.autograd.Function):
     ):
         batch, n_q_heads, n_q, d = Q.size()
         batch, n_kv_heads, n_kv, _ = K.size()
-        scale = math.sqrt(d)
+        # On GPU, exp(x) is computed as exp2(x * log2e)
+        # exp(x) = e^x = (2^(log₂ e))^x = 2^(x · log₂ e) = exp2(x · log₂ e)
+        # so we fold log2e into the scale and use tl.math.exp2 in the kernel
+        qk_scale = (1.0 / math.sqrt(d)) * math.log2(math.e)
         if is_causal:
             assert n_q == n_kv, "FlashAttention only support n_q == n_kv currently"
         assert torch.cuda.is_available()
@@ -64,13 +67,14 @@ class FlashAttention(torch.autograd.Function):
             N_KEYS=n_kv,
             N_Q_HEADS=n_q_heads,
             N_KV_HEADS=n_kv_heads,
-            scale=scale,
+            qk_scale=qk_scale,
             dim=d,
             IS_CAUSAL=is_causal,
         )
 
         ctx.is_causal = is_causal
-        ctx.scale = scale
+        ctx.qk_scale = qk_scale
+        ctx.sm_scale = 1.0 / math.sqrt(d)
         ctx.save_for_backward(L, Q, K, V, O)
 
         return O
@@ -81,7 +85,8 @@ class FlashAttention(torch.autograd.Function):
         L, Q, K, V, O = ctx.saved_tensors
         batch, n_q_heads, n_q, d = Q.size()
         batch, n_kv_heads, n_kv, _ = K.size()
-        scale = ctx.scale
+        qk_scale = ctx.qk_scale
+        sm_scale = ctx.sm_scale
 
         # Init result pointers
         dQ = torch.empty_like(Q, device="cuda")
@@ -129,7 +134,8 @@ class FlashAttention(torch.autograd.Function):
             N_KEYS=n_kv,
             N_Q_HEADS=n_q_heads,
             N_KV_HEADS=n_kv_heads,
-            scale=scale,
+            qk_scale=qk_scale,
+            sm_scale=sm_scale,
             dim=d,
             IS_CAUSAL=ctx.is_causal,
         )
@@ -171,7 +177,8 @@ class FlashAttention(torch.autograd.Function):
             N_KEYS=n_kv,
             N_Q_HEADS=n_q_heads,
             N_KV_HEADS=n_kv_heads,
-            scale=scale,
+            qk_scale=qk_scale,
+            sm_scale=sm_scale,
             dim=d,
             IS_CAUSAL=ctx.is_causal,
         )
