@@ -1,0 +1,15 @@
+name: attention
+
+# Inputs are (batch_size, num_heads, seq_len, d_head) for Q and
+# (batch_size, num_kv_heads, seq_len, d_head) for K and V.
+batch_size: 4
+num_heads: 12
+# Equal to num_heads for MHA; a divisor of num_heads for GQA; 1 for MQA.
+num_kv_heads: 12
+seq_len: 1024
+d_head: 64
+is_causal: true
+
+# Tolerances for the correctness check against bench.reference_provider.
+atol: 1.0e-2
+rtol: 1.0e-2

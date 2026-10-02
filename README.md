@@ -38,8 +38,10 @@ High-level scripts and configurations:
 
 ### 3. `@profiling/` (Performance Toolkit)
 Standalone profiling workloads and configurations:
-- `profiling/run.py`: Hydra entry point for timing, CUDA memory snapshots, and NVTX-annotated runs.
-- `profiling/cases.py`: Workload definitions for a full language model, attention, RMSNorm, and feed-forward layers.
+- `profiling/profile_module.py`: Hydra entry point that profiles an `nn.Module` with per-stage timing, CUDA memory snapshots, and NVTX-annotated runs.
+- `profiling/bench_function.py`: Hydra entry point that benchmarks a single function across providers and shapes with Triton's `do_bench` and `perf_report`.
+- `profiling/cases.py`: Module workloads for a full language model, attention, RMSNorm, and feed-forward layers.
+- `profiling/functions.py`: Function workloads and their providers (e.g. Triton FlashAttention, the eager reference, and PyTorch SDPA).
 - `profiling/protocols.py`: Forward-only, full-training-step, and repeated-backward execution protocols.
 - `profiling/configs/`: Shared execution settings and per-target Hydra configs.
 - `profiling/examples/`: Full-model and attention sweep scripts, optionally captured with Nsight Systems.
@@ -107,10 +109,10 @@ uv run apps/launch_training.py \
 
 **Profiling:**
 
-Run a single profiling case with Hydra overrides:
+Profile a module (where time and memory go) with Hydra overrides:
 
 ```bash
-uv run python -m profiling.run \
+uv run python -m profiling.profile_module \
     case=attention \
     profiling.protocol=full_training_step \
     case.batch_size=8 \
@@ -128,7 +130,16 @@ USE_NSYS=0 ./profiling/examples/run_lm_sweep.sh
 USE_NSYS=0 ./profiling/examples/run_attention_sweep.sh
 ```
 
-See [profiling/README.md](profiling/README.md) for Nsight Systems capture, AMP and `torch.compile` options, artifact naming, and memory-report instructions. Only open memory snapshots from trusted sources because they use Python's pickle format.
+Benchmark a single function (how fast it is) across providers and a swept shape. This writes a CSV and a plot to `bench.output_dir`:
+
+```bash
+uv run python -m profiling.bench_function \
+    bench.mode=fwd_bwd \
+    bench.metric=tflops \
+    'bench.sweep.x_vals=[512,1024,2048,4096]'
+```
+
+See [profiling/README.md](profiling/README.md) for the difference between profiling and benchmarking, benchmark modes and providers, Nsight Systems capture, AMP and `torch.compile` options, artifact naming, and memory-report instructions. Only open memory snapshots from trusted sources because they use Python's pickle format.
 
 ## Development Guidelines
 

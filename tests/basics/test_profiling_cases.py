@@ -12,7 +12,7 @@ CONFIG_DIR = Path(__file__).parents[2] / "profiling" / "configs"
 @pytest.mark.parametrize("target", ["lm", "attention", "rmsnorm", "ffn"])
 def test_profiling_case_config_composes_independently(target):
     with initialize_config_dir(version_base=None, config_dir=str(CONFIG_DIR)):
-        cfg = compose(config_name="profiling", overrides=[f"case={target}"])
+        cfg = compose(config_name="profile_module", overrides=[f"case={target}"])
 
     assert cfg.case.name == target
     assert cfg.torch_compile.enable is False

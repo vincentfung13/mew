@@ -2,12 +2,22 @@ import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"Q_TILE_SIZE": bq, "K_TILE_SIZE": bk}, num_stages=s, num_warps=w)
+        for bq in (64, 128)
+        for bk in (64, 128)
+        for s in (2, 4)
+        for w in (4, 8)
+    ],
+    key=["N_QUERIES", "N_KEYS", "dim", "IS_CAUSAL", "N_Q_HEADS", "N_KV_HEADS"],
+)
 @triton.jit
 def flash_fwd_kernel(
     # pointers to:
-    # Q -> (batch, n_q, d)
-    # K -> (batch, n_kv, d)
-    # V -> (batch, n_kv, d)
+    # Q -> (batch, n_q_heads, n_q, d)
+    # K -> (batch, n_kv_heads, n_kv, d)
+    # V -> (batch, n_kv_heads, n_kv, d)
     Q_ptr,
     K_ptr,
     V_ptr,
@@ -16,33 +26,51 @@ def flash_fwd_kernel(
     O_ptr,
     L_ptr,
     stride_qb,
+    stride_qh,
     stride_qq,
     stride_qd,
     stride_kb,
+    stride_kh,
     stride_kq,
     stride_kd,
     stride_vb,
+    stride_vh,
     stride_vq,
     stride_vd,
     stride_ob,
+    stride_oh,
     stride_oq,
     stride_od,
     stride_lb,
+    stride_lh,
     stride_lq,
-    N_QUERIES,
-    N_KEYS,
-    scale,
+    N_QUERIES: tl.constexpr,
+    N_KEYS: tl.constexpr,
+    N_Q_HEADS: tl.constexpr,
+    N_KV_HEADS: tl.constexpr,
+    qk_scale: tl.constexpr,
     dim: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
 ):
     query_tile_ind = tl.program_id(0)
-    batch_ind = tl.program_id(1)
+    batch_head_ind = tl.program_id(1)
+
+    # Save q_ind range for skipping computation when causal is on
+    # q_ind_lo = query_tile_ind * Q_TILE_SIZE
+    q_ind_hi = (query_tile_ind + 1) * Q_TILE_SIZE - 1
+
+    # Compute inds for q
+    batch_ind = batch_head_ind // N_Q_HEADS
+    head_ind_q = batch_head_ind % N_Q_HEADS
+
+    # Compute head ind for kv (for non-GQA, head_ind_q == head_ind_kv)
+    head_ind_kv = head_ind_q // (N_Q_HEADS // N_KV_HEADS)
 
     # Init input blk ptrs
     Q_block_ptr = tl.make_block_ptr(
-        Q_ptr + batch_ind * stride_qb,
+        Q_ptr + batch_ind * stride_qb + head_ind_q * stride_qh,
         shape=(N_QUERIES, dim),
         strides=(stride_qq, stride_qd),
         offsets=(query_tile_ind * Q_TILE_SIZE, 0),
@@ -50,7 +78,7 @@ def flash_fwd_kernel(
         order=(1, 0),
     )
     K_block_ptr = tl.make_block_ptr(
-        K_ptr + batch_ind * stride_kb,
+        K_ptr + batch_ind * stride_kb + head_ind_kv * stride_kh,
         shape=(N_KEYS, dim),
         strides=(stride_kq, stride_kd),
         offsets=(0, 0),
@@ -58,7 +86,7 @@ def flash_fwd_kernel(
         order=(1, 0),
     )
     V_block_ptr = tl.make_block_ptr(
-        V_ptr + batch_ind * stride_vb,
+        V_ptr + batch_ind * stride_vb + head_ind_kv * stride_vh,
         shape=(N_KEYS, dim),
         strides=(stride_vq, stride_vd),
         offsets=(0, 0),
@@ -68,7 +96,7 @@ def flash_fwd_kernel(
 
     # Init output buffer ptrs
     O_block_ptr = tl.make_block_ptr(
-        O_ptr + batch_ind * stride_ob,
+        O_ptr + batch_ind * stride_ob + head_ind_q * stride_oh,
         shape=(N_QUERIES, dim),
         strides=(stride_oq, stride_od),
         offsets=(query_tile_ind * Q_TILE_SIZE, 0),
@@ -76,7 +104,7 @@ def flash_fwd_kernel(
         order=(1, 0),
     )
     L_block_ptr = tl.make_block_ptr(
-        L_ptr + batch_ind * stride_lb,
+        L_ptr + batch_ind * stride_lb + head_ind_q * stride_lh,
         shape=(N_QUERIES,),
         strides=(stride_lq,),
         offsets=(query_tile_ind * Q_TILE_SIZE,),
@@ -85,20 +113,30 @@ def flash_fwd_kernel(
     )
 
     # Init running max/log_exp_sum/output/log_exp_sum tensor
+    # note: L is of base 2
     M = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32)
     O_acc = tl.zeros((Q_TILE_SIZE, dim), dtype=tl.float32)
     L = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
 
     # Load q tile
     Q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
+
     Q_offsets = query_tile_ind * Q_TILE_SIZE + tl.arange(
         0, Q_TILE_SIZE
     )  # (Q_TILE_SIZE,)
     Q_is_valid = Q_offsets[:, None] < N_QUERIES
 
     # Load K, V tile by tile
-    for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
-        # Load the i_th tile (no need for boundary check on the 1st dim)
+    if IS_CAUSAL:
+        # For causal, if kv_ind_lower > q_ind_higher, we can skip the entire step
+        n_kv_tile = tl.minimum(
+            tl.cdiv(N_KEYS, K_TILE_SIZE), q_ind_hi // K_TILE_SIZE + 1
+        )
+    else:
+        n_kv_tile = tl.cdiv(N_KEYS, K_TILE_SIZE)
+
+    # The main loop
+    for j in range(n_kv_tile):
         K_j = tl.load(
             K_block_ptr, boundary_check=(0,), padding_option="zero"
         )  # (K_TILE_SIZE, dim)
@@ -112,7 +150,9 @@ def flash_fwd_kernel(
         QK_is_valid = Q_is_valid & K_is_valid
 
         # Compute dot product
-        S_ij = tl.dot(Q, tl.trans(K_j)) / scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        # NOTE: qk_scale is applied when we compute max and -max
+        # so ops can be fused by the compiler
+        S_ij = tl.dot(Q, tl.trans(K_j))  # (Q_TILE_SIZE, K_TILE_SIZE)
 
         if IS_CAUSAL:
             # Upper triangular mask
@@ -125,18 +165,18 @@ def flash_fwd_kernel(
             S_ij = tl.where(QK_is_valid, S_ij, -1e6)
 
         # Compute local max, calibrate prev results
-        _M = tl.maximum(M, tl.max(S_ij, axis=1))
+        _M = tl.maximum(M, tl.max(S_ij, axis=1) * qk_scale)
 
         # Normalize by local max logits
-        S_ij -= _M[:, None]  # (Q_TILE_SIZE, K_TILE_SIZE)
+        S_ij = S_ij * qk_scale - _M[:, None]  # (Q_TILE_SIZE, K_TILE_SIZE)
 
         # compute and aggregate exp sum (for backward)
-        P_ij = tl.exp(S_ij)  # (Q_TILE_SIZE, K_TILE_SIZE)
-        M_calibration = tl.exp(M - _M)
+        P_ij = tl.math.exp2(S_ij)  # (Q_TILE_SIZE, K_TILE_SIZE)
+        M_calibration = tl.math.exp2(M - _M)
         L = M_calibration * L + tl.sum(P_ij, axis=1)
 
         # compute, aggregate, calibrate output
-        O_acc = M_calibration[:, None] * O_acc + tl.dot(P_ij, V_j)
+        O_acc = M_calibration[:, None] * O_acc + tl.dot(P_ij.to(V_j.dtype), V_j)
 
         # assign new max
         M = _M
@@ -150,9 +190,10 @@ def flash_fwd_kernel(
 
     # Store log sum + row_max for backward
     # rationale of this logsum trick: when we recompute softmax in backward, we do:
-    #   exp(S_ij - M_i - log(L))
-    # whic automatically reduces to exp(S_ij - M_i) / L
-    L = M + tl.log(L)
+    #   exp2(S_ij - M_i - log(L))
+    # which automatically reduces to exp(S_ij - M_i) / L
+    # Note: L is of base 2 instead of e
+    L = M + tl.log2(L)
 
-    tl.store(O_block_ptr, O_acc, boundary_check=(0,))
+    tl.store(O_block_ptr, O_acc.to(O_ptr.dtype.element_ty), boundary_check=(0,))
     tl.store(L_block_ptr, L, boundary_check=(0,))
