@@ -25,9 +25,9 @@ METRIC=${METRIC:-ms}
 BATCH_SIZE=1
 NUM_HEADS=1
 D_HEADS=(16 32 64 128)
-CAUSALS=(true false)
+CAUSALS=(true)
 SEQ_LENS="[128,256,512,1024,2048,4096,8192,16384,32768,65536]"
-DTYPES=(fp32 bf16)
+DTYPES=(bf16)
 MODES=(fwd bwd fwd_bwd)
 PROVIDERS="[flash_triton,reference,torch_sdpa]"
 

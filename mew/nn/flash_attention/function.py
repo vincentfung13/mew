@@ -17,11 +17,12 @@ class FlashAttention(torch.autograd.Function):
         K: torch.Tensor,  # (batch, n_kv_heads, n_kv, d_head)
         V: torch.Tensor,  # (batch, n_kv_heads, n_kv, d_head)
         is_causal: bool = False,
-        cfg: dict = {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16},
     ):
         batch, n_q_heads, n_q, d = Q.size()
         batch, n_kv_heads, n_kv, _ = K.size()
         scale = math.sqrt(d)
+        if is_causal:
+            assert n_q == n_kv, "FlashAttention only support n_q == n_kv currently"
         assert torch.cuda.is_available()
 
         # Init output buffer:
@@ -32,7 +33,9 @@ class FlashAttention(torch.autograd.Function):
         L = torch.empty((batch, n_q_heads, n_q), dtype=torch.float32, device="cuda")
 
         # Launch triton kernel (launch grid is [n_queries, batch * n_q_heads])
-        flash_fwd_kernel[(triton.cdiv(n_q, cfg["Q_TILE_SIZE"]), batch * n_q_heads)](
+        flash_fwd_kernel[
+            lambda META: (triton.cdiv(n_q, META["Q_TILE_SIZE"]), batch * n_q_heads)
+        ](
             Q,
             K,
             V,
@@ -63,15 +66,11 @@ class FlashAttention(torch.autograd.Function):
             N_KV_HEADS=n_kv_heads,
             scale=scale,
             dim=d,
-            Q_TILE_SIZE=cfg["Q_TILE_SIZE"],
-            K_TILE_SIZE=cfg["K_TILE_SIZE"],
             IS_CAUSAL=is_causal,
         )
 
         ctx.is_causal = is_causal
         ctx.scale = scale
-        ctx.Q_TILE_SIZE = cfg["Q_TILE_SIZE"]
-        ctx.K_TILE_SIZE = cfg["K_TILE_SIZE"]
         ctx.save_for_backward(L, Q, K, V, O)
 
         return O
@@ -94,7 +93,9 @@ class FlashAttention(torch.autograd.Function):
         D = (O.float() * dO).sum(axis=-1)
 
         # Launch triton kernels - two outer loops
-        flash_bwd_kernel_dq[(triton.cdiv(n_q, ctx.Q_TILE_SIZE), batch * n_q_heads)](
+        flash_bwd_kernel_dq[
+            lambda META: (triton.cdiv(n_q, META["Q_TILE_SIZE"]), batch * n_q_heads)
+        ](
             Q,
             K,
             V,
@@ -130,12 +131,12 @@ class FlashAttention(torch.autograd.Function):
             N_KV_HEADS=n_kv_heads,
             scale=scale,
             dim=d,
-            Q_TILE_SIZE=ctx.Q_TILE_SIZE,
-            K_TILE_SIZE=ctx.K_TILE_SIZE,
             IS_CAUSAL=ctx.is_causal,
         )
 
-        flash_bwd_kernel_dkv[(triton.cdiv(n_kv, ctx.K_TILE_SIZE), batch * n_kv_heads)](
+        flash_bwd_kernel_dkv[
+            lambda META: (triton.cdiv(n_kv, META["K_TILE_SIZE"]), batch * n_kv_heads)
+        ](
             Q,
             K,
             V,
@@ -172,9 +173,7 @@ class FlashAttention(torch.autograd.Function):
             N_KV_HEADS=n_kv_heads,
             scale=scale,
             dim=d,
-            Q_TILE_SIZE=ctx.Q_TILE_SIZE,
-            K_TILE_SIZE=ctx.K_TILE_SIZE,
             IS_CAUSAL=ctx.is_causal,
         )
 
-        return dQ, dK, dV, None, None
+        return dQ, dK, dV, None

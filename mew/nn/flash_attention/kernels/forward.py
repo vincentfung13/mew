@@ -2,6 +2,16 @@ import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"Q_TILE_SIZE": bq, "K_TILE_SIZE": bk}, num_stages=s, num_warps=w)
+        for bq in (64, 128)
+        for bk in (64, 128)
+        for s in (1, 2, 4)
+        for w in (4, 8)
+    ],
+    key=["N_QUERIES", "N_KEYS", "dim", "IS_CAUSAL", "N_Q_HEADS", "N_KV_HEADS"],
+)
 @triton.jit
 def flash_fwd_kernel(
     # pointers to:
@@ -34,10 +44,10 @@ def flash_fwd_kernel(
     stride_lb,
     stride_lh,
     stride_lq,
-    N_QUERIES,
-    N_KEYS,
-    N_Q_HEADS,
-    N_KV_HEADS,
+    N_QUERIES: tl.constexpr,
+    N_KEYS: tl.constexpr,
+    N_Q_HEADS: tl.constexpr,
+    N_KV_HEADS: tl.constexpr,
     scale,
     dim: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
@@ -46,6 +56,10 @@ def flash_fwd_kernel(
 ):
     query_tile_ind = tl.program_id(0)
     batch_head_ind = tl.program_id(1)
+
+    # Save q_ind range for skipping computation when causal is on
+    # q_ind_lo = query_tile_ind * Q_TILE_SIZE
+    q_ind_hi = (query_tile_ind + 1) * Q_TILE_SIZE - 1
 
     # Compute inds for q
     batch_ind = batch_head_ind // N_Q_HEADS
@@ -111,8 +125,16 @@ def flash_fwd_kernel(
     Q_is_valid = Q_offsets[:, None] < N_QUERIES
 
     # Load K, V tile by tile
-    for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
-        # Load the i_th tile (no need for boundary check on the 1st dim)
+    if IS_CAUSAL:
+        # For causal, if kv_ind_lower > q_ind_higher, we can skip the entire step
+        n_kv_tile = tl.minimum(
+            tl.cdiv(N_KEYS, K_TILE_SIZE), q_ind_hi // K_TILE_SIZE + 1
+        )
+    else:
+        n_kv_tile = tl.cdiv(N_KEYS, K_TILE_SIZE)
+
+    # The main loop
+    for j in range(n_kv_tile):
         K_j = tl.load(
             K_block_ptr, boundary_check=(0,), padding_option="zero"
         )  # (K_TILE_SIZE, dim)
@@ -165,7 +187,7 @@ def flash_fwd_kernel(
     # Store log sum + row_max for backward
     # rationale of this logsum trick: when we recompute softmax in backward, we do:
     #   exp(S_ij - M_i - log(L))
-    # whic automatically reduces to exp(S_ij - M_i) / L
+    # which automatically reduces to exp(S_ij - M_i) / L
     L = M + tl.log(L)
 
     tl.store(O_block_ptr, O_acc.to(O_ptr.dtype.element_ty), boundary_check=(0,))

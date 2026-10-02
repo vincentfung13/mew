@@ -2,6 +2,16 @@ import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"Q_TILE_SIZE": bq, "K_TILE_SIZE": bk}, num_stages=s, num_warps=w)
+        for bq in (64, 128)
+        for bk in (64, 128)
+        for s in (1, 2, 4)
+        for w in (4, 8)
+    ],
+    key=["N_QUERIES", "N_KEYS", "dim", "IS_CAUSAL", "N_Q_HEADS", "N_KV_HEADS"],
+)
 @triton.jit
 def flash_bwd_kernel_dkv(
     # pointers to:
@@ -112,13 +122,20 @@ def flash_bwd_kernel_dkv(
     dK_j = tl.zeros((K_TILE_SIZE, dim), dtype=tl.float32)
     dV_j = tl.zeros((K_TILE_SIZE, dim), dtype=tl.float32)
 
+    # if causal is on, skip computation if k_ind_lo > q_ind:
+    k_ind_lo = kv_tile_ind * K_TILE_SIZE
+    if IS_CAUSAL:
+        q_start_tile_ind = k_ind_lo // Q_TILE_SIZE
+    else:
+        q_start_tile_ind = 0
+
     GROUP_SIZE = N_Q_HEADS // N_KV_HEADS
     for head_ind_q in range(head_ind_kv * GROUP_SIZE, (head_ind_kv + 1) * GROUP_SIZE):
         Q_block_ptr = tl.make_block_ptr(
             Q_ptr + batch_ind * stride_qb + head_ind_q * stride_qh,
             shape=(N_QUERIES, dim),
             strides=(stride_qq, stride_qd),
-            offsets=(0, 0),
+            offsets=(q_start_tile_ind * Q_TILE_SIZE, 0),
             block_shape=(Q_TILE_SIZE, dim),
             order=(1, 0),
         )
@@ -126,7 +143,7 @@ def flash_bwd_kernel_dkv(
             L_ptr + batch_ind * stride_lb + head_ind_q * stride_lh,
             shape=(N_QUERIES,),
             strides=(stride_lq,),
-            offsets=(0,),
+            offsets=(q_start_tile_ind * Q_TILE_SIZE,),
             block_shape=(Q_TILE_SIZE,),
             order=(0,),
         )
@@ -134,7 +151,7 @@ def flash_bwd_kernel_dkv(
             D_ptr + batch_ind * stride_db + head_ind_q * stride_dh,
             shape=(N_QUERIES,),
             strides=(stride_dq,),
-            offsets=(0,),
+            offsets=(q_start_tile_ind * Q_TILE_SIZE,),
             block_shape=(Q_TILE_SIZE,),
             order=(0,),
         )
@@ -142,13 +159,13 @@ def flash_bwd_kernel_dkv(
             dO_ptr + batch_ind * stride_dob + head_ind_q * stride_doh,
             shape=(N_QUERIES, dim),
             strides=(stride_doq, stride_dod),
-            offsets=(0, 0),
+            offsets=(q_start_tile_ind * Q_TILE_SIZE, 0),
             block_shape=(Q_TILE_SIZE, dim),
             order=(1, 0),
         )
 
         # Load query and compute grad tile by tile
-        for i in range(tl.cdiv(N_QUERIES, Q_TILE_SIZE)):
+        for i in range(q_start_tile_ind, tl.cdiv(N_QUERIES, Q_TILE_SIZE)):
             Q_i = tl.load(
                 Q_block_ptr, boundary_check=(0,), padding_option="zero"
             )  # (Q_TILE_SIZE, dim)
@@ -200,6 +217,16 @@ def flash_bwd_kernel_dkv(
     tl.store(dV_block_ptr, dV_j.to(dV_ptr.dtype.element_ty), boundary_check=(0,))
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"Q_TILE_SIZE": bq, "K_TILE_SIZE": bk}, num_stages=s, num_warps=w)
+        for bq in (64, 128)
+        for bk in (64, 128)
+        for s in (1, 2, 4)
+        for w in (4, 8)
+    ],
+    key=["N_QUERIES", "N_KEYS", "dim", "IS_CAUSAL", "N_Q_HEADS", "N_KV_HEADS"],
+)
 @triton.jit
 def flash_bwd_kernel_dq(
     # pointers to:
@@ -341,8 +368,17 @@ def flash_bwd_kernel_dq(
     # Init buffer for output
     dQ_i = tl.zeros((Q_TILE_SIZE, dim), dtype=tl.float32)
 
+    # For causal, if kv_ind_lo > q_ind_hi, we can skip the entire step
+    q_ind_hi = (query_tile_ind + 1) * Q_TILE_SIZE - 1
+    if IS_CAUSAL:
+        n_kv_tile = tl.minimum(
+            tl.cdiv(N_KEYS, K_TILE_SIZE), q_ind_hi // K_TILE_SIZE + 1
+        )
+    else:
+        n_kv_tile = tl.cdiv(N_KEYS, K_TILE_SIZE)
+
     # Load kv and compute grad tile by tile
-    for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+    for j in range(n_kv_tile):
         # Load K_j and V_j
         K_j = tl.load(
             K_block_ptr, boundary_check=(0,), padding_option="zero"
