@@ -24,8 +24,8 @@ model:
   d_model: 512 
   d_ff: 1344 
   num_heads: 16
-  # GQA: set to <= num_heads and must divide num_heads; null disables (full MHA)
-  num_groups: null
+  # num_kv_heads default to num_heads (MHA)
+  num_kv_heads: ${model.num_heads}
   vocab_size: 10000
   num_transformer_layers: 4
   rope_theta: 10000.0

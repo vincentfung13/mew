@@ -87,8 +87,9 @@ The `attention` function compares:
 - `torch_sdpa`: `torch.nn.functional.scaled_dot_product_attention`, as an
   external baseline.
 
-All three accept `(batch, heads, seq_len, d_head)` inputs and support GQA/MQA
-through `function.num_kv_heads`.
+All three accept `(batch, heads, seq_len, d_head)` inputs. `flash_triton` and
+`torch_sdpa` also support GQA/MQA through `function.num_kv_heads`; `reference`
+is MHA-only, so GQA runs drop it and check against `torch_sdpa` instead:
 
 ```bash
 uv run python -m profiling.bench_function \
@@ -96,6 +97,8 @@ uv run python -m profiling.bench_function \
     bench.metric=tflops \
     bench.sweep.x_name=seq_len \
     'bench.sweep.x_vals=[512,1024,2048,4096]' \
+    'bench.providers=[flash_triton,torch_sdpa]' \
+    bench.reference_provider=torch_sdpa \
     function.num_heads=16 \
     function.num_kv_heads=4 \
     bench.output_dir=benchmarks/attention_gqa_fwd_bwd

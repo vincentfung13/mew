@@ -6,10 +6,7 @@ from typing import Any
 
 import hydra
 import torch
-import triton
-import triton.testing
 from omegaconf import DictConfig, OmegaConf
-from triton.runtime.errors import OutOfResources
 
 from profiling.functions import (
     MODE_FLOP_MULTIPLIER,
@@ -28,7 +25,14 @@ QUANTILES = [0.5, 0.2, 0.8]
 # Resource failures that only invalidate a single (provider, sweep point): CUDA
 # running out of device memory, or a Triton kernel needing more shared memory or
 # registers than the GPU has.
-POINT_RESOURCE_ERRORS = (torch.cuda.OutOfMemoryError, OutOfResources)
+# Triton is imported lazily because it ships no macOS wheels, which keeps the
+# CPU-only helpers importable (and testable) there.
+try:
+    from triton.runtime.errors import OutOfResources
+except ImportError:
+    POINT_RESOURCE_ERRORS = (torch.cuda.OutOfMemoryError,)
+else:
+    POINT_RESOURCE_ERRORS = (torch.cuda.OutOfMemoryError, OutOfResources)
 
 
 class ReferenceUnavailableError(RuntimeError):
@@ -101,6 +105,8 @@ def _time_provider(
     Kept separate from the sweep loop so that its tensors go out of scope as soon
     as it returns or raises.
     """
+    import triton.testing
+
     requires_grad = mode is not BenchMode.FWD
     inputs = case.make_inputs(params, requires_grad)
     fn, grad_to_none = make_timed_fn(mode, case.providers[provider](params), inputs)
@@ -125,6 +131,7 @@ def _to_tflops(ms: float, flops: float) -> float:
 def main(cfg: DictConfig) -> None:
     if cfg.device != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("bench_function requires a CUDA device for do_bench.")
+    import triton.testing
 
     output_dir = Path(cfg.bench.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
