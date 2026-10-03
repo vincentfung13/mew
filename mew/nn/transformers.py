@@ -3,10 +3,12 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.nn.init as init
 
 from mew.nn.layers import RMSNorm, SwiGLU
 from mew.nn.functionals import scaled_dot_product
+from mew.nn.flash_attention.function import FlashAttention
 from mew.nn.rope import RotaryPositionalEmbedding
 
 
@@ -20,6 +22,7 @@ class TransformerBlock(nn.Module):
         # RoPE related params
         theta: float,
         max_seq_len: int = 4096,
+        attn_impl: str = "naive",
     ):
         super().__init__()
         self.ln1 = RMSNorm(d_model=d_model)
@@ -29,6 +32,7 @@ class TransformerBlock(nn.Module):
             num_kv_heads=num_kv_heads,
             theta=theta,
             max_seq_len=max_seq_len,
+            attn_impl=attn_impl,
         )
         self.ln2 = RMSNorm(d_model=d_model)
         self.ffn = SwiGLU(d_model, d_ff)
@@ -49,6 +53,7 @@ class CausalMultiHeadSelfAttn(nn.Module):
         # Params for RoPE
         theta: float,
         max_seq_len: int,
+        attn_impl: str = "naive",
         device: str = None,
         dtype: torch.dtype = None,
     ):
@@ -58,6 +63,8 @@ class CausalMultiHeadSelfAttn(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.d_model = d_model
         self.d_head = d_model // num_heads
+        self.attn_impl = attn_impl
+        assert attn_impl in ["naive", "flash_triton", "torch_sdpa"]
 
         # 1. q always keeps the full resolution
         self.q_proj = nn.Parameter(torch.empty(d_model, d_model))
@@ -79,8 +86,41 @@ class CausalMultiHeadSelfAttn(nn.Module):
                 theta=theta, d_head=self.d_head, max_seq_len=max_seq_len
             )
 
+    def _sdpa(
+        self,
+        q: torch.Tensor,  # (... num_q_heads seq_len d_head)
+        k: torch.Tensor,  # (... num_kv_heads seq_len d_head)
+        v: torch.Tensor,  # (... num_kv_heads seq_len d_head)
+        is_causal: bool = True,
+    ) -> torch.Tensor:
+        if self.attn_impl == "naive":
+            # Create causal mask
+            # Mask shape: (seq_len, seq_len)
+            # True for allowed positions (i >= j), False elsewhere
+            seq_len = q.size(-2)
+            mask = None
+            if is_causal:
+                mask = torch.tril(
+                    torch.ones(seq_len, seq_len, dtype=torch.bool, device=q.device)
+                )
+            agg_v = scaled_dot_product(q=q, k=k, v=v, mask=mask)
+        elif self.attn_impl == "torch_sdpa":
+            agg_v = F.scaled_dot_product_attention(
+                query=q,
+                key=k,
+                value=v,
+                is_causal=is_causal,
+                enable_gqa=(q.size(-3) != k.size(-3)),
+            )
+        else:
+            agg_v = FlashAttention.apply(q, k, v, is_causal)
+        return agg_v
+
     def forward(
-        self, x: torch.Tensor, token_positions: torch.Tensor = None
+        self,
+        x: torch.Tensor,
+        token_positions: torch.Tensor = None,
+        is_causal: bool = True,
     ) -> torch.Tensor:
         # x: (... seq_len d_model)
 
@@ -131,17 +171,8 @@ class CausalMultiHeadSelfAttn(nn.Module):
             q = self.rope(q, token_positions)
             k = self.rope(k, token_positions)
 
-        # Create causal mask
-        # Mask shape: (seq_len, seq_len)
-        # True for allowed positions (i >= j), False elsewhere
-        seq_len = x.size(-2)
-        mask = torch.tril(
-            torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device)
-        )
-
-        # Compute scaled dot product
-        # agg_v -> (... seq_len num_heads * d)
-        agg_v = scaled_dot_product(q=q, k=k, v=v, mask=mask)
+        # Support different SDPA providers
+        agg_v = self._sdpa(q=q, k=k, v=v, is_causal=is_causal)
         agg_v = rearrange(agg_v, "... num_heads seq_len d -> ... seq_len (num_heads d)")
 
         # Cast back to d_model

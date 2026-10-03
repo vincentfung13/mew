@@ -1,16 +1,10 @@
 import math
 import torch
-import triton
-
-from mew.nn.flash_attention.kernels.forward import flash_fwd_kernel
-from mew.nn.flash_attention.kernels.backward import (
-    flash_bwd_kernel_dkv,
-    flash_bwd_kernel_dq,
-)
 
 
 class FlashAttention(torch.autograd.Function):
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
     def forward(
         ctx,
         Q: torch.Tensor,  # (batch, n_q_heads, n_q, d_head)
@@ -36,6 +30,9 @@ class FlashAttention(torch.autograd.Function):
         L = torch.empty((batch, n_q_heads, n_q), dtype=torch.float32, device="cuda")
 
         # Launch triton kernel (launch grid is [n_queries, batch * n_q_heads])
+        import triton
+        from mew.nn.flash_attention.kernels.forward import flash_fwd_kernel
+
         flash_fwd_kernel[
             lambda META: (triton.cdiv(n_q, META["Q_TILE_SIZE"]), batch * n_q_heads)
         ](
@@ -80,6 +77,7 @@ class FlashAttention(torch.autograd.Function):
         return O
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, dO: torch.Tensor):
         # Retrieve saved tensors from forward
         L, Q, K, V, O = ctx.saved_tensors
@@ -98,6 +96,12 @@ class FlashAttention(torch.autograd.Function):
         D = (O.float() * dO).sum(axis=-1)
 
         # Launch triton kernels - two outer loops
+        import triton
+        from mew.nn.flash_attention.kernels.backward import (
+            flash_bwd_kernel_dkv,
+            flash_bwd_kernel_dq,
+        )
+
         flash_bwd_kernel_dq[
             lambda META: (triton.cdiv(n_q, META["Q_TILE_SIZE"]), batch * n_q_heads)
         ](

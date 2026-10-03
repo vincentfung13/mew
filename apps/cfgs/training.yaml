@@ -23,6 +23,9 @@ data:
 model:
   d_model: 512 
   d_ff: 1344 
+  # attention implementation:
+  # naive | flash_triton | torch_sdpa (flash_triton requires cuda)
+  attn_impl: naive
   num_heads: 16
   # num_kv_heads default to num_heads (MHA)
   num_kv_heads: ${model.num_heads}
@@ -37,6 +40,9 @@ trainer:
   log_freq: 10
   resume_checkpoint_path: null
   resume: false
+  amp:
+    enable: true
+    dtype: bf16
 
 # AdawmW params
 optim:

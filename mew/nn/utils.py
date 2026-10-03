@@ -15,5 +15,6 @@ def build_model(cfg: DictConfig, device: str = "cuda") -> torch.nn.Module:
         context_len=cfg.model.context_len,  # keep context len consistent with training
         num_transformer_layers=cfg.model.num_transformer_layers,
         rope_theta=cfg.model.rope_theta,
+        attn_impl=cfg.model.get("attn_impl", "naive"),
     ).to(device)
     return model

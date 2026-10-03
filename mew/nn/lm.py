@@ -16,6 +16,7 @@ class TransformerLM(nn.Module):
         context_len: int,
         num_transformer_layers: int,
         rope_theta: float,
+        attn_impl: str = "naive",
     ):
         super().__init__()
 
@@ -33,6 +34,7 @@ class TransformerLM(nn.Module):
                     d_ff=d_ff,
                     theta=rope_theta,
                     max_seq_len=context_len,
+                    attn_impl=attn_impl,
                 )
             )
         self.layers = nn.Sequential(*layers)
