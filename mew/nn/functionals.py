@@ -50,65 +50,31 @@ def scaled_dot_product(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    num_kv_groups: int = None,
     mask: torch.Tensor = None,
 ) -> torch.Tensor:
-    if num_kv_groups is None:
-        # q -> (batch ... seq_len_q d_head)
-        # k -> (batch ... seq_len_k d_head)
-        # v -> (batch ... seq_len_k d_head)
-        # mask -> (seq_len seq_len)
-        # returns output -> (batch ... seq_len_q d_head)
-        qk_dot = einsum(
-            q,
-            k,
-            "batch ... seq_len_q d_head, batch ... seq_len_k d_head -> batch ... seq_len_q seq_len_k",
-        )
-        qk_dot = qk_dot / math.sqrt(q.size()[-1])
+    # q -> (batch ... seq_len_q d_head)
+    # k -> (batch ... seq_len_k d_head)
+    # v -> (batch ... seq_len_k d_head)
+    # mask -> (seq_len seq_len)
+    # returns output -> (batch ... seq_len_q d_head)
+    assert q.size(-3) == k.size(-3), "GQA is not supported for naive SDPA"
+    qk_dot = einsum(
+        q,
+        k,
+        "batch ... seq_len_q d_head, batch ... seq_len_k d_head -> batch ... seq_len_q seq_len_k",
+    )
+    qk_dot = qk_dot / math.sqrt(q.size()[-1])
 
-        # Before softmax, apply mask if specified
-        if mask is not None:
-            # Set very negative value (e.g., -1e9) to masked positions
-            qk_dot = qk_dot.masked_fill(~mask, float("-inf"))
-        attn_weights = softmax(qk_dot, dim=-1)  # (batch ... seq_len_q seq_len_k)
+    # Before softmax, apply mask if specified
+    if mask is not None:
+        # Set very negative value (e.g., -1e9) to masked positions
+        qk_dot = qk_dot.masked_fill(~mask, float("-inf"))
+    attn_weights = softmax(qk_dot, dim=-1)  # (batch ... seq_len_q seq_len_k)
 
-        # Reduce with V
-        aggregated_v = einsum(
-            attn_weights,
-            v,
-            "batch ... seq_len_q seq_len_k, batch ... seq_len_k d_head -> batch ... seq_len_q d_head",
-        )
-    else:
-        # q -> (batch ... num_heads seq_len_q d_head)
-        q_src_shape = "batch ... (num_groups num_grouped_queries) seq_len_q d_head"
-        q_tgt_shape = "batch ... num_groups num_grouped_queries seq_len_q d_head"
-        q = rearrange(q, f"{q_src_shape} -> {q_tgt_shape}", num_groups=num_kv_groups)
-
-        # k * v -> (batch ... num_groups seq_len_k d_head)
-        kv_tgt_shape = "batch ... num_groups seq_len_k d_head"
-
-        # Compute qk dot
-        qk_dot_tgt_shape = (
-            "batch ... num_groups num_grouped_queries seq_len_q seq_len_k"
-        )
-        qk_dot = einsum(q, k, f"{q_tgt_shape}, {kv_tgt_shape} -> {qk_dot_tgt_shape}")
-        qk_dot = qk_dot / math.sqrt(q.size()[-1])
-
-        # Compute attention weight
-        # before softmax, apply mask if specified
-        if mask is not None:
-            # Set very negative value (e.g., -1e9) to masked positions
-            qk_dot = qk_dot.masked_fill(~mask, float("-inf"))
-        attn_weights = softmax(qk_dot, dim=-1)  # (batch ... seq_len_q seq_len_k)
-
-        # Reduce with V
-        agg_v_tgt_shape = "batch ... num_groups num_grouped_queries seq_len_q d_head"
-        output_tgt_shape = "batch ... (num_groups num_grouped_queries) seq_len_q d_head"
-        aggregated_v = einsum(
-            attn_weights, v, f"{qk_dot_tgt_shape}, {kv_tgt_shape} -> {agg_v_tgt_shape}"
-        )
-        aggregated_v = rearrange(
-            aggregated_v, f"{agg_v_tgt_shape} -> {output_tgt_shape}"
-        )
-
+    # Reduce with V
+    aggregated_v = einsum(
+        attn_weights,
+        v,
+        "batch ... seq_len_q seq_len_k, batch ... seq_len_k d_head -> batch ... seq_len_q d_head",
+    )
     return aggregated_v

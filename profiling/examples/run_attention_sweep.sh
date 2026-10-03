@@ -30,7 +30,6 @@ for d_model in "${D_MODELS[@]}"; do
             case.seq_len="$seq_len" \
             case.d_model="$d_model" \
             case.num_heads="$NUM_HEADS" \
-            case.num_groups=null \
             profiling.exec_steps=100
     done
 done

@@ -14,8 +14,8 @@ class RotaryPositionalEmbedding(nn.Module):
         # ks & inverse_freq -> (d_head_half)
         # inds -> (max_seq_len)
         ks = torch.arange(1, d_head // 2 + 1, device=device).float()
-        self.inverse_freq = 1.0 / (theta ** ((2 * ks - 2) / d_head))
         inds = torch.arange(0, max_seq_len, device=device).float()
+        self.inverse_freq = 1.0 / (theta ** ((2 * ks - 2) / d_head))
 
         # Init sin and cos cache
         # compute outer product
@@ -51,8 +51,12 @@ class RotaryPositionalEmbedding(nn.Module):
             self._update_cache(max_seq_len)
 
         # Select sin and cos based on token positions
-        sin_selected = self.sin[token_positions]  # (... seq_len, d_head_half)
-        cos_selected = self.cos[token_positions]  # (... seq_len, d_head_half)
+        sin_selected = self.sin[token_positions].to(
+            x.dtype
+        )  # (... seq_len, d_head_half)
+        cos_selected = self.cos[token_positions].to(
+            x.dtype
+        )  # (... seq_len, d_head_half)
 
         # Rearrange x into pairs: (..., seq_len, d_head) -> (..., seq_len, d_head_half, 2)
         x_rearr = rearrange(
