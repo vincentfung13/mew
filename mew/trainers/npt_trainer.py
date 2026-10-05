@@ -21,9 +21,6 @@ from mew.trainers.utils import (
 LOGGER = logging.getLogger(__name__)
 
 
-torch.autograd.set_detect_anomaly(True)
-
-
 class NPTTrainer:
     def __init__(self, cfg: DictConfig, wandb=None):
         # Init dataloader

@@ -1,12 +1,27 @@
 import os
+import random
 
 import hydra
+import numpy as np
+import torch
 from omegaconf import DictConfig
 from omegaconf import OmegaConf
 
 
+def seed_everything(seed: int) -> None:
+    # The data loader samples batch offsets with the global numpy RNG,
+    # and model weights are initialized with the global torch RNG.
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
 @hydra.main(version_base=None, config_path="cfgs", config_name="training")
 def main(cfg: DictConfig) -> None:
+    # Seed before the trainer builds the model and data loaders
+    if cfg.get("seed") is not None:
+        seed_everything(cfg.seed)
+
     # Copy tokenizer to save dir
     os.system(f"cp -r {cfg.data.tokenizer_path} {cfg.save_dir}/tokenizer")
 

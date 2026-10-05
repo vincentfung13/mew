@@ -5,6 +5,8 @@ defaults:
 task_name: npt_training
 run_name: pilot_run
 device: cuda
+# Seeds python, numpy (data sampling) and torch (weight init) RNGs; null disables seeding
+seed: 42
 save_dir: checkpoints/${run_name}/${now:%Y-%m-%d-%H-%M-%S}
 
 hydra:
@@ -12,8 +14,8 @@ hydra:
     dir: ${save_dir}
 
 data:
-  train_file: data/tiny_stories_train.tokens.fixed.uint16.npy 
-  val_file: data/tiny_stories_val.tokens.fixed.uint16.npy
+  train_file: data/tiny_stories_train.tokens.uint16.npy
+  val_file: data/tiny_stories_val.tokens.uint16.npy
   batch_size: 128 
   seq_len: 256 
   # This is use to save the tokenizer used to tokenize the training set
