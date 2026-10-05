@@ -5,6 +5,8 @@ name: attention
 batch_size: 4
 num_heads: 12
 # Equal to num_heads for MHA; a divisor of num_heads for GQA; 1 for MQA.
+# The reference provider is MHA-only: for GQA/MQA, drop it from bench.providers
+# and set bench.reference_provider=torch_sdpa.
 num_kv_heads: 12
 seq_len: 1024
 d_head: 64

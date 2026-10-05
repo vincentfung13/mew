@@ -15,12 +15,12 @@ This repo exists so the user can learn how a GPT-like model works by implementin
 - **Debugging and review are read-only.** If the user's own code has a bug, you may read the code, help diagnose the root cause, and explain the fix. The user applies the fix.
 - **Non-core work outside `mew/` may be implemented directly** when the user asks, e.g. Hydra configs, scripts under `apps/`, profiling tools under `profiling/`, reusable agent skills under `skills/`, tests, or documentation. When unsure whether something counts as "core," ask.
 
-## 0.1 Ask Before Running Every Command
+## 0.1 Commands: Let the User Run the Experiments
 
-- **Before running any shell command, show the exact command, explain what it does, and wait for the user's explicit approval.** This applies to every command, including read-only ones (`ls`, `git status`, `git diff`), tests, linters, formatters, and `uv` commands.
-- One approval covers one command only. Do not chain extra commands onto an approved one, and do not treat an earlier approval as permission for later commands.
-- If a command fails or times out, report it and ask before running anything else, including cleanup or recovery steps.
-- This overrides the "always run" instructions in the sections below. Those describe which checks to *propose*, not to run unprompted.
+- Read-only inspection commands (e.g. `ls`, `grep`, `find`, `git status`, `git diff`, `git log`) may be run freely.
+- Prefer that the user runs tests, profiling jobs, benchmarks, and training runs themselves, since doing so is part of the hands-on learning. Propose the exact command and what to look for in the output instead of running it.
+- Ask before running anything that changes state: formatters, installs (`uv pip install`, `uv sync`), git operations that modify history or the working tree, deleting files, or long-running GPU jobs.
+- The "always run" instructions in later sections describe which checks to *propose*; the user decides whether to run them.
 
 ## 1. Background
 

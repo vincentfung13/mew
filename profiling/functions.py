@@ -82,9 +82,6 @@ def _flash_triton_provider(params: Mapping[str, Any]) -> Provider:
 
 
 def _reference_provider(params: Mapping[str, Any]) -> Provider:
-    is_gqa = params["num_kv_heads"] != params["num_heads"]
-    num_kv_groups = params["num_kv_heads"] if is_gqa else None
-
     def run(q, k, v):
         mask = None
         if params["is_causal"]:
@@ -92,7 +89,7 @@ def _reference_provider(params: Mapping[str, Any]) -> Provider:
             mask = torch.tril(
                 torch.ones(seq_len, seq_len, dtype=torch.bool, device=q.device)
             )
-        return scaled_dot_product(q, k, v, num_kv_groups=num_kv_groups, mask=mask)
+        return scaled_dot_product(q, k, v, mask=mask)
 
     return run
 

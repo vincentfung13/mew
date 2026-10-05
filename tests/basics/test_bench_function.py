@@ -53,11 +53,11 @@ def test_parse_mode_rejects_unknown_value():
         parse_mode("unknown")
 
 
-@pytest.mark.parametrize("num_kv_heads", [4, 2, 1], ids=["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_attention_providers_agree_on_cpu(num_kv_heads, is_causal):
+def test_attention_providers_agree_on_cpu(is_causal):
     # flash_triton needs CUDA; the reference and torch_sdpa providers must agree.
-    cfg = _attention_cfg(num_kv_heads=num_kv_heads, is_causal=is_causal)
+    # MHA only: the reference implementation does not support GQA/MQA.
+    cfg = _attention_cfg(is_causal=is_causal)
     case = build_function_case(cfg, device="cpu")
     params = OmegaConf.to_container(cfg.function)
 

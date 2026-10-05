@@ -11,12 +11,12 @@ class TransformerLM(nn.Module):
         d_model: int,
         d_ff: int,
         num_heads: int,
+        num_kv_heads: int,
         vocab_size: int,
         context_len: int,
         num_transformer_layers: int,
         rope_theta: float,
-        # GQA configuration
-        num_groups: int = None,
+        attn_impl: str = "naive",
     ):
         super().__init__()
 
@@ -30,10 +30,11 @@ class TransformerLM(nn.Module):
                 TransformerBlock(
                     d_model=d_model,
                     num_heads=num_heads,
+                    num_kv_heads=num_kv_heads,
                     d_ff=d_ff,
                     theta=rope_theta,
                     max_seq_len=context_len,
-                    num_groups=num_groups,
+                    attn_impl=attn_impl,
                 )
             )
         self.layers = nn.Sequential(*layers)

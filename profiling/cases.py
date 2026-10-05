@@ -37,11 +37,11 @@ def _build_lm_case(cfg: DictConfig, device: str) -> ProfilingCase:
         d_model=cfg.case.d_model,
         d_ff=cfg.case.d_ff,
         num_heads=cfg.case.num_heads,
+        num_kv_heads=cfg.case.num_heads,
         vocab_size=cfg.case.vocab_size,
         context_len=cfg.case.context_len,
         num_transformer_layers=cfg.case.num_transformer_layers,
         rope_theta=cfg.case.rope_theta,
-        num_groups=cfg.case.num_groups,
     ).to(device)
     tokens = torch.randint(
         low=0,
@@ -66,10 +66,10 @@ def _build_attention_case(cfg: DictConfig, device: str) -> ProfilingCase:
     module = CausalMultiHeadSelfAttn(
         d_model=cfg.case.d_model,
         num_heads=cfg.case.num_heads,
+        num_kv_heads=cfg.case.num_heads,
         theta=cfg.case.rope_theta,
         max_seq_len=cfg.case.max_seq_len,
         device=device,
-        num_groups=cfg.case.num_groups,
     ).to(device)
     return ProfilingCase(
         module=module,

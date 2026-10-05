@@ -153,7 +153,11 @@ def run_multihead_self_attention(
     from mew.nn.transformers import CausalMultiHeadSelfAttn
 
     layer = CausalMultiHeadSelfAttn(
-        d_model=d_model, num_heads=num_heads, theta=None, max_seq_len=100
+        d_model=d_model,
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+        theta=None,
+        max_seq_len=100,
     )
     layer.load_state_dict(
         {
@@ -207,7 +211,11 @@ def run_multihead_self_attention_with_rope(
     from mew.nn.transformers import CausalMultiHeadSelfAttn
 
     layer = CausalMultiHeadSelfAttn(
-        d_model=d_model, num_heads=num_heads, theta=theta, max_seq_len=max_seq_len
+        d_model=d_model,
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+        theta=theta,
+        max_seq_len=max_seq_len,
     )
     layer.load_state_dict(
         {
@@ -319,7 +327,11 @@ def run_transformer_block(
     from mew.nn.transformers import TransformerBlock
 
     layer = TransformerBlock(
-        num_heads=num_heads, d_model=d_model, d_ff=d_ff, theta=theta
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+        d_model=d_model,
+        d_ff=d_ff,
+        theta=theta,
     )
     layer.load_state_dict(
         {
@@ -423,6 +435,7 @@ def run_transformer_lm(
         d_model=d_model,
         d_ff=d_ff,
         num_heads=num_heads,
+        num_kv_heads=num_heads,
         vocab_size=vocab_size,
         context_len=context_length,
         num_transformer_layers=num_layers,

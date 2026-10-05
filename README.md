@@ -103,7 +103,7 @@ uv run apps/launch_training.py \
     model.d_model=512 \
     model.d_ff=1344 \
     model.num_heads=16 \
-    model.num_groups=null
+    model.num_kv_heads=16
 ```
 *Note: The launch scripts use Hydra, so you can override configurations via the CLI (e.g., `uv run apps/launch_training.py wandb.enable=True`).*
 

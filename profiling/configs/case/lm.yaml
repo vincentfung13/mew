@@ -6,7 +6,6 @@ seq_len: 256
 d_model: 768
 d_ff: 3072
 num_heads: 12
-num_groups: null
 vocab_size: 10000
 num_transformer_layers: 12
 rope_theta: 10000.0

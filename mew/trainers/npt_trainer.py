@@ -89,6 +89,19 @@ class NPTTrainer:
                 lr_scheduler=self.lr_scheduler,
             )
 
+        # AMP
+        self.amp_dtype = None
+        # Only supporting bf16 for now
+        if cfg.trainer.amp.enable:
+            try:
+                self.amp_dtype = {
+                    "bf16": torch.bfloat16,
+                }[cfg.trainer.amp.dtype]
+            except KeyError as error:
+                raise ValueError(
+                    f"Unsupported AMP dtype: {cfg.trainer.amp.dtype}"
+                ) from error
+
         self.cfg = cfg
 
     def train(self):
@@ -100,9 +113,10 @@ class NPTTrainer:
             )
 
             # Forward
-            logits = self.model(data)
-            loss = cross_entropy(logits, target)
-            scaled_loss = loss / self.cfg.optim.grad_accumulation_steps
+            with self._autocast():
+                logits = self.model(data)
+                loss = cross_entropy(logits.float(), target)
+                scaled_loss = loss / self.cfg.optim.grad_accumulation_steps
             scaled_loss.backward()
 
             # log weight norm and gradient norm
@@ -126,13 +140,13 @@ class NPTTrainer:
 
             # log progress
             if step % self.cfg.trainer.log_freq == 0:
-                # Run mini val
-                with torch.no_grad():
+                with torch.no_grad(), self._autocast():
+                    # Run mini val
                     val_data, val_target = self.val_data_loader.get_batch(
                         device=self.cfg.device
                     )
                     val_logits = self.model(val_data)
-                    val_loss = cross_entropy(val_logits, val_target)
+                    val_loss = cross_entropy(val_logits.float(), val_target)
 
                 LOGGER.info(
                     "Step [%d/%d], Train Loss: %.4f, Val Loss: %.4f LR: %.6f",
@@ -168,3 +182,10 @@ class NPTTrainer:
                     lr_scheduler=self.lr_scheduler,
                 )
                 LOGGER.info(f"Checkpoint saved to {ckpt_path}")
+
+    def _autocast(self):
+        return torch.autocast(
+            device_type=torch.device(self.cfg.device).type,
+            dtype=self.amp_dtype,
+            enabled=self.cfg.trainer.amp.enable,
+        )
