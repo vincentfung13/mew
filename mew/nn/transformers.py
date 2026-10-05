@@ -54,6 +54,7 @@ class CausalMultiHeadSelfAttn(nn.Module):
         theta: float,
         max_seq_len: int,
         attn_impl: str = "naive",
+        is_causal: bool = True,
         device: str = None,
         dtype: torch.dtype = None,
     ):
@@ -65,6 +66,8 @@ class CausalMultiHeadSelfAttn(nn.Module):
         self.d_head = d_model // num_heads
         self.attn_impl = attn_impl
         assert attn_impl in ["naive", "flash_triton", "torch_sdpa"]
+
+        self.is_causal = is_causal
 
         # 1. q always keeps the full resolution
         self.q_proj = nn.Parameter(torch.empty(d_model, d_model))
@@ -91,7 +94,6 @@ class CausalMultiHeadSelfAttn(nn.Module):
         q: torch.Tensor,  # (... num_q_heads seq_len d_head)
         k: torch.Tensor,  # (... num_kv_heads seq_len d_head)
         v: torch.Tensor,  # (... num_kv_heads seq_len d_head)
-        is_causal: bool = True,
     ) -> torch.Tensor:
         if self.attn_impl == "naive":
             # Create causal mask
@@ -99,7 +101,7 @@ class CausalMultiHeadSelfAttn(nn.Module):
             # True for allowed positions (i >= j), False elsewhere
             seq_len = q.size(-2)
             mask = None
-            if is_causal:
+            if self.is_causal:
                 mask = torch.tril(
                     torch.ones(seq_len, seq_len, dtype=torch.bool, device=q.device)
                 )
@@ -109,18 +111,17 @@ class CausalMultiHeadSelfAttn(nn.Module):
                 query=q,
                 key=k,
                 value=v,
-                is_causal=is_causal,
+                is_causal=self.is_causal,
                 enable_gqa=(q.size(-3) != k.size(-3)),
             )
         else:
-            agg_v = FlashAttention.apply(q, k, v, is_causal)
+            agg_v = FlashAttention.apply(q, k, v, self.is_causal)
         return agg_v
 
     def forward(
         self,
         x: torch.Tensor,
         token_positions: torch.Tensor = None,
-        is_causal: bool = True,
     ) -> torch.Tensor:
         # x: (... seq_len d_model)
 
@@ -172,7 +173,7 @@ class CausalMultiHeadSelfAttn(nn.Module):
             k = self.rope(k, token_positions)
 
         # Support different SDPA providers
-        agg_v = self._sdpa(q=q, k=k, v=v, is_causal=is_causal)
+        agg_v = self._sdpa(q=q, k=k, v=v)
         agg_v = rearrange(agg_v, "... num_heads seq_len d -> ... seq_len (num_heads d)")
 
         # Cast back to d_model
@@ -184,3 +185,30 @@ class CausalMultiHeadSelfAttn(nn.Module):
         )
 
         return output
+
+    def flops_per_token(self, seq_len: int) -> int:
+        flops_per_token = 0
+
+        # 1. input projections (input is d_model)
+        # q: (1, d_model) @ (d_model, n_heads * d_head) -> 2 * d_model * n_heads * d_head
+        # kv: (1, d_model) @ (d_model, n_kv_heads * d_head) -> 4 * d_model * n_kv_heads * d_head
+        flops_per_token += 2 * self.num_heads * self.d_model * self.d_head
+        flops_per_token += 4 * self.num_kv_heads * self.d_model * self.d_head
+
+        _flops_attn_score = 0
+        # 2. s = q @ k_T
+        # each token's query dots (mul-add) with all the ks
+        _flops_attn_score += 2 * seq_len * self.d_head * self.num_heads
+
+        # 3. o = p @ v
+        # each token's attn score mul-add with all the vs
+        _flops_attn_score += 2 * seq_len * self.d_head * self.num_heads
+        if self.is_causal:
+            _flops_attn_score = _flops_attn_score // 2
+        flops_per_token += _flops_attn_score
+
+        # 4. output projection
+        # o: (1, d_model) @ (d_model, d_model) -> 2 * d_model * d_model (same flops as q_proj)
+        flops_per_token += 2 * self.d_model * self.d_model
+
+        return flops_per_token
