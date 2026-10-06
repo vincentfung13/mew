@@ -7,7 +7,9 @@ import torch
 from omegaconf import DictConfig
 from omegaconf import OmegaConf
 
-from mew.perf.gpu_specs import GPUSpec, peak_flops_per_second
+from mew.perf.gpu_specs import GPUSpec, peak_tflops_per_second
+from mew.trainers.npt_trainer import NPTTrainer
+from mew.trainers.dist_context import DistContext
 
 AMP_DTYPES = {"bf16": torch.bfloat16}
 
@@ -32,31 +34,42 @@ def load_gpu_specs(raw) -> list[GPUSpec]:
     return specs
 
 
-def resolve_peak_tflops(cfg: DictConfig) -> None:
+def resolve_peak_tflops(cfg: DictConfig, dist_context: DistContext) -> None:
     # Fill trainer.perf.peak_tflops from the GPU model (cfgs/gpu_specs.yaml)
-    # unless it was set explicitly. Left null on non-CUDA devices, where MFU is
-    # undefined.
     if cfg.trainer.perf.peak_tflops is not None:
-        return
-    if torch.device(cfg.device).type != "cuda":
         return
     dtype = (
         AMP_DTYPES[cfg.trainer.amp.dtype] if cfg.trainer.amp.enable else torch.float32
     )
     gpu_specs = load_gpu_specs(cfg.gpu_specs)
-    cfg.trainer.perf.peak_tflops = (
-        peak_flops_per_second(cfg.device, dtype, gpu_specs) / 1e12
+    cfg.trainer.perf.peak_tflops = peak_tflops_per_second(
+        dist_context.device, dtype, gpu_specs
     )
+
+
+def _validate_cfg(cfg: DictConfig):
+    assert cfg.device == "cuda", "Training needs to be run on GPUs!"
+    assert cfg.task_name in ["npt_training"], f"Unknown task_name: {cfg.task_name}!"
+    if cfg.trainer.log_grads_and_weights_norm:
+        assert (
+            cfg.wandb.enable
+        ), "wandb is needed when log_grads_and_weights_norm is True!"
 
 
 @hydra.main(version_base=None, config_path="cfgs", config_name="training")
 def main(cfg: DictConfig) -> None:
+    _validate_cfg(cfg)
+
+    # For distributed training
+    dist_context = DistContext.from_env()
+    torch.cuda.set_device(dist_context.device)
+
     # Seed before the trainer builds the model and data loaders
     if cfg.get("seed") is not None:
         seed_everything(cfg.seed)
 
     # Resolve before saving, so the saved config records the peak actually used
-    resolve_peak_tflops(cfg)
+    resolve_peak_tflops(cfg, dist_context)
 
     # Copy tokenizer to save dir
     os.system(f"cp -r {cfg.data.tokenizer_path} {cfg.save_dir}/tokenizer")
@@ -74,13 +87,8 @@ def main(cfg: DictConfig) -> None:
         wandb.init(project=cfg.wandb.project, name=cfg.run_name, config=container)
 
     # Launch training job
-    if cfg.task_name == "npt_training":
-        from mew.trainers.npt_trainer import NPTTrainer
-
-        trainer = NPTTrainer(cfg, wandb)
-        trainer.train()
-    else:
-        raise ValueError(f"Unknown task_name: {cfg.task_name}")
+    trainer = NPTTrainer(cfg, dist_context=dist_context, wandb=wandb)
+    trainer.train()
 
 
 if __name__ == "__main__":

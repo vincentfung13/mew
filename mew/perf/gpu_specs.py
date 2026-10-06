@@ -16,7 +16,6 @@ from collections.abc import Sequence
 
 import torch
 
-_TERA = 1e12
 _HALF_DTYPES = (torch.bfloat16, torch.float16)
 
 
@@ -60,17 +59,17 @@ def _precision_key(dtype: torch.dtype, fp32_matmul_precision: str) -> str:
             f"Ambiguous peak for fp32 matmul precision '{fp32_matmul_precision}'; "
             "set trainer.perf.peak_tflops explicitly."
         )
-    raise ValueError(f"No peak FLOP/s defined for dtype {dtype}.")
+    raise ValueError(f"No peak TFLOP/s defined for dtype {dtype}.")
 
 
-def peak_flops_for(
+def peak_tflops_for(
     device_name: str,
     dtype: torch.dtype,
     gpu_specs: Sequence[GPUSpec],
     fp32_matmul_precision: str | None = None,
 ) -> float:
     """
-    Peak dense FLOP/s of the GPU called `device_name` (as reported by
+    Peak dense TFLOP/s of the GPU called `device_name` (as reported by
     `torch.cuda.get_device_name`) for matmuls in `dtype`.
 
     `fp32_matmul_precision` only matters for fp32 and defaults to the global
@@ -83,7 +82,7 @@ def peak_flops_for(
     name = device_name.lower()
     for gpu_spec in gpu_specs:
         if all(s in name for s in gpu_spec.match):
-            return getattr(gpu_spec, precision_key) * _TERA
+            return getattr(gpu_spec, precision_key)
 
     raise ValueError(
         f"Unknown GPU '{device_name}': add it to apps/cfgs/gpu_specs.yaml or set "
@@ -91,13 +90,15 @@ def peak_flops_for(
     )
 
 
-def peak_flops_per_second(
+def peak_tflops_per_second(
     device: str | torch.device,
     dtype: torch.dtype,
     gpu_specs: Sequence[GPUSpec],
 ) -> float:
-    """Peak dense FLOP/s of the CUDA `device` for matmuls in `dtype`."""
+    """Peak dense TFLOP/s of the CUDA `device` for matmuls in `dtype`."""
     device = torch.device(device)
     if device.type != "cuda":
-        raise ValueError(f"Peak FLOP/s is only defined for CUDA devices, got {device}.")
-    return peak_flops_for(torch.cuda.get_device_name(device), dtype, gpu_specs)
+        raise ValueError(
+            f"Peak TFLOP/s is only defined for CUDA devices, got {device}."
+        )
+    return peak_tflops_for(torch.cuda.get_device_name(device), dtype, gpu_specs)

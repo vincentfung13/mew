@@ -17,12 +17,17 @@ from mew.trainers.utils import (
     load_checkpoint,
     log_gradient_norm_and_weight_norm,
 )
+from mew.trainers.dist_context import DistContext
+from mew.perf.utils import module_flops_per_token
+from mew.perf.throughput_meter import ThroughputMeter
 
 LOGGER = logging.getLogger(__name__)
 
 
 class NPTTrainer:
-    def __init__(self, cfg: DictConfig, wandb=None):
+    def __init__(self, cfg: DictConfig, dist_context: DistContext, wandb=None):
+        self.dist_context = dist_context
+
         # Init dataloader
         LOGGER.info(
             "Init train dataloader from %s with seq_len=%d",
@@ -51,7 +56,17 @@ class NPTTrainer:
         LOGGER.info("Init LM model and optimizer")
         self.model = build_model(
             cfg=cfg,
-            device=cfg.device,
+            device=dist_context.device,
+        )
+
+        # Calculate flops per tokens for the model (multiplying by 3 to account for backward)
+        model_flops_per_token = (
+            module_flops_per_token(module=self.model, seq_len=cfg.data.seq_len) * 3
+        )
+        self.throughput_meter = ThroughputMeter(
+            model_flops_per_token=model_flops_per_token,
+            device_peak_tflops=cfg.trainer.perf.peak_tflops,
+            device=dist_context.device,
         )
 
         # Init optimizer and lr scheduler
@@ -102,11 +117,14 @@ class NPTTrainer:
         self.cfg = cfg
 
     def train(self):
+        # Start profiling clock once
+        self.throughput_meter.start()
+
         # Main training loop
         for step in range(1, self.cfg.trainer.total_steps + 1):
             # Get batch
             data, target = self.train_data_loader.get_batch(
-                device=self.cfg.device,
+                device=self.dist_context.device,
             )
 
             # Forward
@@ -116,8 +134,12 @@ class NPTTrainer:
                 scaled_loss = loss / self.cfg.optim.grad_accumulation_steps
             scaled_loss.backward()
 
-            # log weight norm and gradient norm
-            if step % self.cfg.trainer.log_freq == 0:
+            # Optional: log grad and weight norm (adds overhead to training)
+            if (
+                self.cfg.trainer.log_grads_and_weights_norm
+                and step % self.cfg.trainer.log_freq == 0
+                and step % self.cfg.optim.grad_accumulation_steps == 0
+            ):
                 log_gradient_norm_and_weight_norm(
                     wandb=self.wandb,
                     model=self.model,
@@ -135,33 +157,43 @@ class NPTTrainer:
                 self.lr_scheduler.step()
                 self.optim.zero_grad()
 
+            # step throughput_meter
+            self.throughput_meter.step(data.numel())
+
             # log progress
             if step % self.cfg.trainer.log_freq == 0:
                 with torch.no_grad(), self._autocast():
                     # Run mini val
                     val_data, val_target = self.val_data_loader.get_batch(
-                        device=self.cfg.device
+                        device=self.dist_context.device
                     )
                     val_logits = self.model(val_data)
                     val_loss = cross_entropy(val_logits.float(), val_target)
 
+                # Create item for logging
+                log_item = {
+                    "train/loss": loss.item(),
+                    "val/loss": val_loss.item(),
+                    "train/lr": self.optim.param_groups[0]["lr"],
+                }
+                # retrieve throughput stats
+                for key, val in self.throughput_meter.report().items():
+                    log_item["perf/" + key] = val
+
+                if self.wandb is not None:
+                    self.wandb.log(log_item, step=step)
+
                 LOGGER.info(
-                    "Step [%d/%d], Train Loss: %.4f, Val Loss: %.4f LR: %.6f",
+                    "Step [%d/%d] %s",
                     step,
                     self.cfg.trainer.total_steps,
-                    loss.item(),
-                    val_loss.item(),
-                    self.optim.param_groups[0]["lr"],
+                    " | ".join(
+                        f"{k}={_logging_format(k, v)}" for k, v in log_item.items()
+                    ),
                 )
-                if self.wandb is not None:
-                    self.wandb.log(
-                        {
-                            "train/loss": loss.item(),
-                            "val/loss": val_loss.item(),
-                            "train/lr": self.optim.param_groups[0]["lr"],
-                        },
-                        step=step,
-                    )
+
+                # restart throughput meter
+                self.throughput_meter.start()
 
             # Save checkpoint
             if step % self.cfg.trainer.save_freq == 0:
@@ -182,7 +214,20 @@ class NPTTrainer:
 
     def _autocast(self):
         return torch.autocast(
-            device_type=torch.device(self.cfg.device).type,
+            device_type=self.dist_context.device.type,
             dtype=self.amp_dtype,
             enabled=self.cfg.trainer.amp.enable,
         )
+
+
+def _logging_format(key: str, value: float) -> str:
+    # Human-readable formatting for the log line; wandb gets the raw values.
+    if key.endswith("mfu"):
+        return f"{value:.1%}"
+    if key.endswith("tokens_per_s"):
+        return f"{value:,.0f}"
+    if key.endswith("_gib"):
+        return f"{value:.2f}"
+    if key.endswith("lr"):
+        return f"{value:.2e}"
+    return f"{value:.4f}"

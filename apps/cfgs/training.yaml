@@ -42,6 +42,7 @@ trainer:
   total_steps: 10000 
   save_freq: 10000
   log_freq: 10
+  log_grads_and_weights_norm: false
   resume_checkpoint_path: null
   resume: false
   amp:

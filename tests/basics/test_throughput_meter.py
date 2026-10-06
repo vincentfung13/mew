@@ -6,7 +6,7 @@ Interface under test:
 
     meter = ThroughputMeter(
         model_flops_per_token,  # training FLOPs per token (already x3)
-        device_peak_flops,      # this GPU's peak FLOP/s for the training dtype
+        device_peak_tflops,     # this GPU's peak TFLOP/s for the training dtype
         device,                 # memory stats are only reported for CUDA
         clock=time.perf_counter,
     )
@@ -14,8 +14,9 @@ Interface under test:
     meter.step(num_tokens)       # count the tokens processed by one step
     meter.report()               # -> dict for the current window, does not reset it
 
-`report()` keys: "tokens_per_s", "mfu", and on CUDA also
-"peak_mem_allocated_gib" and "peak_mem_reserved_gib" (bytes / 2**30).
+`report()` keys: "tokens_per_s", "mfu" (omitted when `device_peak_tflops` is
+None, e.g. on CPU), and on CUDA also "peak_mem_allocated_gib" and
+"peak_mem_reserved_gib" (bytes / 2**30).
 
 The meter measures end-to-end time: everything between start() and report()
 counts, including data loading and logging.
@@ -35,7 +36,7 @@ requires_cuda = pytest.mark.skipif(
 
 TOKENS_PER_STEP = 128 * 256
 FLOPS_PER_TOKEN = 108_576_768
-PEAK_FLOPS = 312e12
+PEAK_TFLOPS = 312.0
 
 
 class FakeClock:
@@ -52,7 +53,7 @@ class FakeClock:
 def _make_meter(clock, device="cpu"):
     return ThroughputMeter(
         model_flops_per_token=FLOPS_PER_TOKEN,
-        device_peak_flops=PEAK_FLOPS,
+        device_peak_tflops=PEAK_TFLOPS,
         device=device,
         clock=clock,
     )
@@ -94,7 +95,7 @@ def test_mfu():
     _run_steps(meter, clock, num_steps=10, seconds_per_step=0.2)
 
     report = meter.report()
-    expected = report["tokens_per_s"] * FLOPS_PER_TOKEN / PEAK_FLOPS
+    expected = report["tokens_per_s"] * FLOPS_PER_TOKEN / (PEAK_TFLOPS * 1e12)
     assert report["mfu"] == pytest.approx(expected)
     assert 0.0 < report["mfu"] < 1.0
 
@@ -111,6 +112,22 @@ def test_mfu_depends_on_elapsed_time():
         reports.append(meter.report())
 
     assert reports[1]["mfu"] == pytest.approx(reports[0]["mfu"] / 2)
+
+
+def test_peak_is_given_in_tflops():
+    # The peak is in TFLOP/s and model FLOPs per token are raw FLOPs; the meter
+    # is the one place that converts. 1e6 tokens/s x 1e6 FLOPs/token = 1e12
+    # FLOP/s, which is exactly a 1 TFLOP/s peak.
+    clock = FakeClock()
+    meter = ThroughputMeter(
+        model_flops_per_token=1_000_000,
+        device_peak_tflops=1.0,
+        device="cpu",
+        clock=clock,
+    )
+    meter.start()
+    _run_steps(meter, clock, num_steps=1, seconds_per_step=1.0, tokens=1_000_000)
+    assert meter.report()["mfu"] == pytest.approx(1.0)
 
 
 def test_report_does_not_reset_the_window():
@@ -147,6 +164,24 @@ def test_cpu_report_has_no_memory_stats(device):
     meter.start()
     _run_steps(meter, clock, num_steps=1, seconds_per_step=1.0)
     assert set(meter.report()) == {"tokens_per_s", "mfu"}
+
+
+def test_unknown_peak_reports_throughput_without_mfu():
+    # On CPU runs trainer.perf.peak_tflops stays null: MFU is undefined, but
+    # tokens/s is still worth logging.
+    clock = FakeClock()
+    meter = ThroughputMeter(
+        model_flops_per_token=FLOPS_PER_TOKEN,
+        device_peak_tflops=None,
+        device="cpu",
+        clock=clock,
+    )
+    meter.start()
+    _run_steps(meter, clock, num_steps=10, seconds_per_step=0.2)
+
+    report = meter.report()
+    assert set(report) == {"tokens_per_s"}
+    assert report["tokens_per_s"] == pytest.approx(10 * TOKENS_PER_STEP / 2.0)
 
 
 @requires_cuda
