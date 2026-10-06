@@ -1,5 +1,7 @@
 defaults:
   - _self_
+  # GPU peak FLOP/s table for MFU, available as cfg.gpu_specs
+  - gpu_specs
   - override hydra/job_logging: custom
 
 task_name: npt_training
@@ -45,6 +47,11 @@ trainer:
   amp:
     enable: true
     dtype: bf16
+  perf:
+    # Peak dense TFLOP/s of one GPU for the matmul dtype (the MFU denominator).
+    # null = look up from the GPU name and AMP dtype in gpu_specs.yaml; stays
+    # null on non-CUDA devices, where MFU is undefined.
+    peak_tflops: null
 
 # AdawmW params
 optim:

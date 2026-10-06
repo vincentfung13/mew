@@ -5,7 +5,7 @@ Interface under test:
 - `flops_per_token(self, seq_len) -> int` on every module that owns a matmul
   (`Linear`, `SwiGLU`, `CausalMultiHeadSelfAttn`). It returns *forward* FLOPs
   per token; the trainer multiplies by 3 for a training step.
-- `module_flops_per_token(module, seq_len)` in `mew/perf.py`. A module that
+- `module_flops_per_token(module, seq_len)` in `mew/perf/utils.py`. A module that
   defines `flops_per_token` is counted via that method and its children are
   NOT visited (so an MoE layer or a looping parent can account for how often
   its children actually run). Modules without the method recurse into their
@@ -31,7 +31,7 @@ from mew.nn.functionals import cross_entropy
 from mew.nn.layers import Embedding, Linear, RMSNorm, SwiGLU
 from mew.nn.lm import TransformerLM
 from mew.nn.transformers import CausalMultiHeadSelfAttn
-from mew.perf import module_flops_per_token
+from mew.perf.utils import module_flops_per_token
 
 D_MODEL = 64
 NUM_HEADS = 4
