@@ -5,7 +5,6 @@ from omegaconf import DictConfig
 
 import torch
 
-from mew.tokenization.bpe import BPETokenizer
 from mew.nn.utils import build_model
 from mew.nn.functionals import cross_entropy
 from mew.optimizers.adamw import AdamW
@@ -22,6 +21,88 @@ from mew.perf.utils import module_flops_per_token
 from mew.perf.throughput_meter import ThroughputMeter
 
 LOGGER = logging.getLogger(__name__)
+
+
+class TrainStep:
+    def __init__(self, cfg: DictConfig, dist_context: DistContext):
+        self.dist_context = dist_context
+
+        # Init model
+        LOGGER.info("Init LM model and optimizer")
+        self.model = build_model(
+            cfg=cfg,
+            device=dist_context.device,
+        )
+        self.model_flops_per_token = (
+            module_flops_per_token(module=self.model, seq_len=cfg.data.seq_len) * 3
+        )
+        LOGGER.info(f"Model initialized, FLOPs/token: {self.model_flops_per_token}")
+
+        # Init optimizer and lr scheduler
+        self.optim = AdamW(
+            params=self.model.parameters(),
+            lr=cfg.optim.lr,
+            weight_decay=cfg.optim.weight_decay,
+            betas=cfg.optim.betas,
+            eps=cfg.optim.eps,
+        )
+        self.lr_scheduler = CosineAnnealingScheduler(
+            optimizer=self.optim,
+            max_learning_rate=cfg.optim.lr,
+            min_learning_rate=cfg.optim.min_lr,
+            warmup_iters=cfg.optim.warmup_iters,
+            cosine_cycle_iters=cfg.optim.cosine_cycle_iters,
+        )
+
+        # AMP
+        self.amp_dtype = None
+        # Only supporting bf16 for now
+        if cfg.trainer.amp.enable:
+            try:
+                self.amp_dtype = {
+                    "bf16": torch.bfloat16,
+                }[cfg.trainer.amp.dtype]
+            except KeyError as error:
+                raise ValueError(
+                    f"Unsupported AMP dtype: {cfg.trainer.amp.dtype}"
+                ) from error
+
+        self.cfg = cfg
+
+    def forward(
+        self,
+        data: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        with self._autocast():
+            logits = self.model(data)
+            loss = cross_entropy(logits.float(), target)
+        return loss
+
+    def backward(
+        self,
+        loss: torch.Tensor,
+    ):
+        # Handle gradient accmulation
+        scaled_loss = loss / self.cfg.optim.grad_accumulation_steps
+        scaled_loss.backward()
+
+    def optim_and_lr_scheduler_step(self):
+        if self.cfg.optim.grad_clip_norm > 0:
+            clip_gradients(
+                parameters=self.model.parameters(),
+                max_l2_norm=self.cfg.optim.grad_clip_norm,
+            )
+        self.optim.step()
+        self.lr_scheduler.step()
+        self.optim.zero_grad()
+
+    def _autocast(self):
+        return torch.autocast(
+            device_type=self.dist_context.device.type,
+            dtype=self.amp_dtype,
+            enabled=self.cfg.trainer.amp.enable,
+        )
 
 
 class NPTTrainer:
@@ -41,7 +122,7 @@ class NPTTrainer:
             is_training=True,
         )
         LOGGER.info(
-            "Starting running evalidation, init val dataloader from %s with seq_len=%d",
+            "Starting running validation, init val dataloader from %s with seq_len=%d",
             cfg.data.val_file,
             cfg.data.seq_len,
         )
@@ -52,68 +133,29 @@ class NPTTrainer:
             is_training=False,
         )
 
-        # Init model
-        LOGGER.info("Init LM model and optimizer")
-        self.model = build_model(
-            cfg=cfg,
-            device=dist_context.device,
-        )
-
-        # Calculate flops per tokens for the model (multiplying by 3 to account for backward)
-        model_flops_per_token = (
-            module_flops_per_token(module=self.model, seq_len=cfg.data.seq_len) * 3
-        )
-        self.throughput_meter = ThroughputMeter(
-            model_flops_per_token=model_flops_per_token,
-            device_peak_tflops=cfg.trainer.perf.peak_tflops,
-            device=dist_context.device,
-        )
-
-        # Init optimizer and lr scheduler
-        self.optim = AdamW(
-            params=self.model.parameters(),
-            lr=cfg.optim.lr,
-            weight_decay=cfg.optim.weight_decay,
-            betas=cfg.optim.betas,
-            eps=cfg.optim.eps,
-        )
-        self.lr_scheduler = CosineAnnealingScheduler(
-            optimizer=self.optim,
-            max_learning_rate=cfg.optim.lr,
-            min_learning_rate=cfg.optim.min_lr,
-            warmup_iters=cfg.optim.warmup_iters,
-            cosine_cycle_iters=cfg.optim.cosine_cycle_iters,
-        )
-        self.tokenizer = BPETokenizer.from_dir(cfg.data.tokenizer_path)
-
-        self.wandb = wandb
-
-        # Load checkpoint
+        # Init train step
+        self.train_step = TrainStep(cfg=cfg, dist_context=dist_context)
+        self.start_step = 0
         if cfg.trainer.resume:
             LOGGER.info(
                 "Resume training from checkpoint: %s",
                 cfg.trainer.resume_checkpoint_path,
             )
-            load_checkpoint(
+            self.start_step = load_checkpoint(
                 src=cfg.trainer.resume_checkpoint_path,
-                model=self.model,
-                optimizer=self.optim,
-                lr_scheduler=self.lr_scheduler,
+                model=self.train_step.model,
+                optimizer=self.train_step.optim,
+                lr_scheduler=self.train_step.lr_scheduler,
             )
 
-        # AMP
-        self.amp_dtype = None
-        # Only supporting bf16 for now
-        if cfg.trainer.amp.enable:
-            try:
-                self.amp_dtype = {
-                    "bf16": torch.bfloat16,
-                }[cfg.trainer.amp.dtype]
-            except KeyError as error:
-                raise ValueError(
-                    f"Unsupported AMP dtype: {cfg.trainer.amp.dtype}"
-                ) from error
+        # Throughput meter for MFU logging
+        self.throughput_meter = ThroughputMeter(
+            model_flops_per_token=self.train_step.model_flops_per_token,
+            device_peak_tflops=cfg.trainer.perf.peak_tflops,
+            device=dist_context.device,
+        )
 
+        self.wandb = wandb
         self.cfg = cfg
 
     def train(self):
@@ -121,18 +163,15 @@ class NPTTrainer:
         self.throughput_meter.start()
 
         # Main training loop
-        for step in range(1, self.cfg.trainer.total_steps + 1):
+        for step in range(self.start_step + 1, self.cfg.trainer.total_steps + 1):
             # Get batch
             data, target = self.train_data_loader.get_batch(
                 device=self.dist_context.device,
             )
 
-            # Forward
-            with self._autocast():
-                logits = self.model(data)
-                loss = cross_entropy(logits.float(), target)
-                scaled_loss = loss / self.cfg.optim.grad_accumulation_steps
-            scaled_loss.backward()
+            # Forward and backward
+            loss = self.train_step.forward(data=data, target=target)
+            self.train_step.backward(loss)
 
             # Optional: log grad and weight norm (adds overhead to training)
             if (
@@ -142,39 +181,31 @@ class NPTTrainer:
             ):
                 log_gradient_norm_and_weight_norm(
                     wandb=self.wandb,
-                    model=self.model,
+                    model=self.train_step.model,
                     step=step,
                 )
 
-            # Backward
+            # Optim and lr scheduler step
             if step % self.cfg.optim.grad_accumulation_steps == 0:
-                if self.cfg.optim.grad_clip_norm > 0:
-                    clip_gradients(
-                        parameters=self.model.parameters(),
-                        max_l2_norm=self.cfg.optim.grad_clip_norm,
-                    )
-                self.optim.step()
-                self.lr_scheduler.step()
-                self.optim.zero_grad()
+                self.train_step.optim_and_lr_scheduler_step()
 
             # step throughput_meter
             self.throughput_meter.step(data.numel())
 
             # log progress
             if step % self.cfg.trainer.log_freq == 0:
-                with torch.no_grad(), self._autocast():
+                with torch.no_grad():
                     # Run mini val
                     val_data, val_target = self.val_data_loader.get_batch(
                         device=self.dist_context.device
                     )
-                    val_logits = self.model(val_data)
-                    val_loss = cross_entropy(val_logits.float(), val_target)
+                    val_loss = self.train_step.forward(data=val_data, target=val_target)
 
                 # Create item for logging
                 log_item = {
                     "train/loss": loss.item(),
                     "val/loss": val_loss.item(),
-                    "train/lr": self.optim.param_groups[0]["lr"],
+                    "train/lr": self.train_step.optim.param_groups[0]["lr"],
                 }
                 # retrieve throughput stats
                 for key, val in self.throughput_meter.report().items():
@@ -204,20 +235,13 @@ class NPTTrainer:
                     f"checkpoint_step_{step}.pt",
                 )
                 save_checkpoint(
-                    model=self.model,
-                    optimizer=self.optim,
+                    model=self.train_step.model,
+                    optimizer=self.train_step.optim,
                     iteration=step,
                     output_path=ckpt_path,
-                    lr_scheduler=self.lr_scheduler,
+                    lr_scheduler=self.train_step.lr_scheduler,
                 )
                 LOGGER.info(f"Checkpoint saved to {ckpt_path}")
-
-    def _autocast(self):
-        return torch.autocast(
-            device_type=self.dist_context.device.type,
-            dtype=self.amp_dtype,
-            enabled=self.cfg.trainer.amp.enable,
-        )
 
 
 def _logging_format(key: str, value: float) -> str:

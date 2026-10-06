@@ -7,7 +7,7 @@ Tests for the GPU peak-FLOP/s lookup (the MFU denominator):
 - `peak_tflops_for(device_name, dtype, gpu_specs, fp32_matmul_precision=None)`
   and `peak_tflops_per_second(device, dtype, gpu_specs)`: the first spec whose
   `match` substrings all appear in the lower-cased device name wins.
-- `load_gpu_specs(raw)` in apps/launch_training.py converts the entries of
+- `load_gpu_specs(entries)` in mew/perf/gpu_specs.py converts the entries of
   apps/cfgs/gpu_specs.yaml into GPUSpecs, naming the index of a bad entry.
 
 Device names are the strings `torch.cuda.get_device_name()` reports, so the
@@ -21,8 +21,12 @@ import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
-from apps.launch_training import load_gpu_specs
-from mew.perf.gpu_specs import GPUSpec, peak_tflops_for, peak_tflops_per_second
+from mew.perf.gpu_specs import (
+    GPUSpec,
+    load_gpu_specs,
+    peak_tflops_for,
+    peak_tflops_per_second,
+)
 
 CFG_DIR = Path(__file__).resolve().parents[2] / "apps" / "cfgs"
 H100_SXM = "NVIDIA H100 80GB HBM3"
@@ -217,12 +221,18 @@ def test_invalid_peak_is_rejected(peaks):
 
 
 # ---------------------------------------------------------------------------
-# load_gpu_specs (apps/launch_training.py)
+# load_gpu_specs
 # ---------------------------------------------------------------------------
 
 
 def test_load_converts_config_entries():
     specs = load_gpu_specs(OmegaConf.create([_entry(["H100"], half=5.0)]))
+    assert specs == [GPUSpec(match=("h100",), half=5.0, tf32=2.0, fp32=3.0)]
+
+
+def test_load_accepts_plain_python_entries():
+    # Not tied to OmegaConf: any iterable of mappings works.
+    specs = load_gpu_specs([_entry(["H100"], half=5.0)])
     assert specs == [GPUSpec(match=("h100",), half=5.0, tf32=2.0, fp32=3.0)]
 
 

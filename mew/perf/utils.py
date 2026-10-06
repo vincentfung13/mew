@@ -27,3 +27,22 @@ def module_flops_per_token(
                 module=child_module, seq_len=seq_len
             )
     return flops_per_token
+
+
+def compute_mfu(
+    tokens_per_s: float, model_flops_per_token: int, peak_tflops: float
+) -> float:
+    mfu = tokens_per_s * model_flops_per_token / (peak_tflops * 1e12)
+    return mfu
+
+
+def peak_memory_stats(device: torch.device) -> dict[str, float]:
+    if device.type != "cuda":
+        return {}
+
+    peak_mem_allocated_gib = torch.cuda.max_memory_allocated(device) / 2**30
+    peak_mem_reserved_gib = torch.cuda.max_memory_reserved(device) / 2**30
+    return {
+        "peak_mem_allocated_gib": peak_mem_allocated_gib,
+        "peak_mem_reserved_gib": peak_mem_reserved_gib,
+    }

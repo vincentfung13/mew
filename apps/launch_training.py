@@ -7,7 +7,7 @@ import torch
 from omegaconf import DictConfig
 from omegaconf import OmegaConf
 
-from mew.perf.gpu_specs import GPUSpec, peak_tflops_per_second
+from mew.perf.gpu_specs import load_gpu_specs, peak_tflops_per_second
 from mew.trainers.npt_trainer import NPTTrainer
 from mew.trainers.dist_context import DistContext
 
@@ -20,18 +20,6 @@ def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-
-
-def load_gpu_specs(raw) -> list[GPUSpec]:
-    # Convert the cfg.gpu_specs entries (cfgs/gpu_specs.yaml) into GPUSpecs,
-    # naming the offending entry if one is malformed.
-    specs = []
-    for index, entry in enumerate(OmegaConf.to_container(raw)):
-        try:
-            specs.append(GPUSpec(**entry))
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"Invalid gpu_specs entry {index}: {error}") from error
-    return specs
 
 
 def resolve_peak_tflops(cfg: DictConfig, dist_context: DistContext) -> None:

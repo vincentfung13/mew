@@ -4,78 +4,97 @@ This toolkit has two entry points that answer different questions:
 
 | Entry point | Question | How |
 |---|---|---|
-| `profile_module.py` | *Where* do time and memory go inside an `nn.Module`? | Per-stage timing (forward, backward, optimizer), NVTX ranges for Nsight Systems, CUDA memory snapshots, optional `torch.compile`. |
+| `profile_module.py` | *Where* do time and memory go in a training step of the model? | Runs the trainer's own `TrainStep` on a synthetic batch: per-stage timing (forward, backward, optimizer step), achieved TFLOP/s and MFU, peak memory, NVTX ranges for Nsight Systems, CUDA memory snapshots. |
 | `bench_function.py` | *How fast* is a function, compared across implementations and shapes? | `triton.testing.do_bench` with CUDA events and L2 flushing, swept with `triton.testing.perf_report` into a CSV and a plot. |
 
 Benchmarking finds what is slow. Profiling explains why. A typical loop is to spot
 a regression or gap with `bench_function`, then reproduce that configuration with
-`profile_module` (or Nsight Compute) to diagnose it.
+`profile_module` (or Nsight Compute) to diagnose it. `profile_module` is
+model-level only; layer-level comparisons belong in `bench_function`.
 
-## Profile a module
+## Profile the training step
 
-`profile_module` supports four targets: `lm`, `attention`, `rmsnorm`, and `ffn`.
-Each target defines its module, representative inputs, and backward objective in
-`cases.py`. Timing, NVTX annotation, and memory capture are shared in
-`profile_module.py`.
+`profile_module` profiles exactly what the trainer runs. Its config composes
+`apps/cfgs/training.yaml` (through `hydra.searchpath`), so the model, data shape,
+AMP setting, optimizer and GPU peak table are the training ones, and the step is
+`mew.trainers.npt_trainer.TrainStep`, the same object `NPTTrainer` uses. Each
+step runs forward, backward and, on gradient-accumulation boundaries, the
+optimizer and LR-scheduler step, exactly as in training. The input is a fixed
+synthetic batch already on the GPU, so there is no data loading, validation,
+logging or checkpointing in the timed region.
 
-Run one target directly with Hydra overrides:
+Run from the repository root (the search path is relative to the working
+directory) and override the training keys directly:
 
 ```bash
 uv run python -m profiling.profile_module \
-    case=attention \
-    profiling.protocol=full_training_step \
-    case.batch_size=8 \
-    case.seq_len=1024 \
-    case.d_model=2048 \
-    case.num_heads=16
+    model.attn_impl=flash_triton \
+    model.num_kv_heads=4 \
+    data.batch_size=64 \
+    trainer.amp.enable=true
 ```
 
-Three execution protocols are available through `profiling.protocol`:
+Only the profiling settings live under `profiling.*`:
 
-- `forward_only`: runs `exec_steps` forwards under `torch.no_grad()`.
-- `full_training_step`: runs `exec_steps` iterations of gradient reset, forward,
-  loss, backward, and optimizer update.
-- `repeat_backward_on_same_graph`: resets gradients once, runs `exec_steps`
-  forwards, and then backpropagates through the final forward graph
-  `exec_steps` times without updating parameters. The graph is retained between
-  backward calls and released after the final call.
+- `warmup_steps`, `exec_steps`: untimed warmup steps, then timed steps.
+- `nvtx.annotate_modules`: per-module NVTX ranges; `nvtx.use_cudart_range`
+  limits Nsight capture to the timed steps.
+- `memory_profiling.enable`: records allocation history over the timed steps and
+  dumps a `.pkl` snapshot.
+- `output_dir`: where the log, `metrics.json`, the snapshot and Nsight reports go.
 
-Warmup follows the same ordering as the selected protocol. Timings include each
-individual operation. The repeated-backward protocol additionally reports
-aggregate `forward_phase` and `backward_phase` timings.
+### Output
 
-Run a focused sweep without Nsight Systems capture:
+The run logs a table with one row per stage and writes the same numbers to
+`<output_dir>/metrics.json`, together with peak memory and the configuration:
+
+```text
+stage             count    mean (s)    var (s^2)     p95 (s)     p99 (s)      tokens/s   TFLOP/s      MFU
+forward              10    ...
+backward             10    ...
+optimizer_step       10    ...                                                         -         -        -
+total                10    ...
+peak_mem_allocated_gib: ...
+peak_mem_reserved_gib: ...
+```
+
+- **TFLOP/s and MFU** count model FLOPs from `mew.perf.utils.module_flops_per_token`:
+  forward ×1, backward ×2, total ×3 per token. The optimizer step does no model
+  FLOPs, so it has none. The peak comes from `trainer.perf.peak_tflops` if set,
+  otherwise from the GPU table in `apps/cfgs/gpu_specs.yaml` for the AMP dtype.
+  On CPU there is no peak, so MFU is omitted.
+- **tokens/s** is reported for whole steps only (`total`).
+- **Peak memory** covers the timed steps only (warmup excluded).
+
+The `total` MFU uses the same FLOP count and peak as the trainer's `perf/mfu`,
+so it is the compute-only upper bound for training at that configuration. A
+large gap between the two is overhead in the training loop (data loading,
+logging, validation), not model compute.
+
+Every stage boundary synchronizes the GPU so stages can be timed separately.
+Per-module NVTX hooks and memory-history recording add CPU overhead to every
+step, and the run logs a warning when either is on. For clean MFU numbers,
+disable both:
 
 ```bash
+uv run python -m profiling.profile_module \
+    profiling.nvtx.annotate_modules=false \
+    profiling.memory_profiling.enable=false
+```
+
+### Sweeps and Nsight Systems
+
+`examples/run_lm_sweep.sh` profiles a list of model sizes, each with and without
+bf16 AMP, and captures each run with Nsight Systems by default:
+
+```bash
+./profiling/examples/run_lm_sweep.sh
 USE_NSYS=0 ./profiling/examples/run_lm_sweep.sh
-USE_NSYS=0 ./profiling/examples/run_attention_sweep.sh
 ```
 
-Enable `torch.compile` for either sweep with environment variables:
-
-```bash
-TORCH_COMPILE=1 \
-TORCH_COMPILE_MODE=reduce-overhead \
-USE_NSYS=0 \
-./profiling/examples/run_attention_sweep.sh
-```
-
-`TORCH_COMPILE` defaults to `0`. `TORCH_COMPILE_MODE` defaults to `default` and
-also accepts `reduce-overhead`, `max-autotune`, and
-`max-autotune-no-cudagraphs`. With at least one warmup step, initial compilation
-occurs during warmup and is excluded from measured iterations. Per-module NVTX
-hooks are disabled for compiled runs because they can introduce graph breaks;
-the outer stage ranges remain enabled.
-
-The attention example sweeps `d_model` over `16`, `32`, `64`, and `128` and
-`seq_len` over `256`, `1024`, `4096`, `8192`, and `16384`, always with one
-attention head and batch size eight. The batch size is included in every output
-directory and artifact name. The longest sequences may require substantial GPU
-memory because attention memory grows quadratically with sequence length.
-
-Each target owns its parameters in `configs/case/<target>.yaml`. The shared
-`configs/profile_module.yaml` contains only execution settings such as AMP,
-timing, NVTX, memory capture, and output paths.
+Each run writes to `profiles/lm_<name>_b<batch>_s<seq>_<amp_bf16|fp32>/`.
+Distributed (DDP/FSDP) profiling is not supported yet; the profiler raises if
+launched with more than one process.
 
 ## Benchmark a function
 
@@ -189,16 +208,15 @@ uv run skills/pytorch-memory-report/scripts/render_memory_report.py \
     --output profiles/<run-name>/memory-report.html
 ```
 
-Memory snapshots and Nsight reports are named after their output directory. The
-directory includes `eager` or `compile_<mode>` so compiled and eager artifacts
-cannot overwrite one another. For example,
-`profiling.output_dir=profiles/attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_training_step`
-writes:
+Memory snapshots and Nsight reports are named after their output directory. For
+example, `profiling.output_dir=profiles/lm_xl_b4_s256_amp_bf16` writes:
 
 ```text
-profiles/attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_training_step/
-├── attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_training_step.pkl
-└── attention_b8_d64_s4096_h1_compile_reduce_overhead_fp32_full_training_step.nsys-rep
+profiles/lm_xl_b4_s256_amp_bf16/
+├── metrics.json
+├── profile_module.log
+├── lm_xl_b4_s256_amp_bf16.pkl
+└── lm_xl_b4_s256_amp_bf16.nsys-rep
 ```
 
 The `.nsys-rep` file is produced only when `USE_NSYS=1`. Nsight Systems adds

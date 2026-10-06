@@ -15,7 +15,7 @@ A custom implementation of a GPT-like language model developed entirely from scr
 - **Generators**: Autoregressive text generation logic.
 - **Trainer**: Training loops with experiment tracking (W&B integration).
 - **Configuration Management**: Hydra-based configuration for easy parameter sweeping and experiment management.
-- **Performance Profiling**: Configurable timing, CUDA memory, NVTX/Nsight Systems, AMP, and `torch.compile` profiling for full models and individual layers.
+- **Performance Profiling**: MFU, tokens/s and peak-memory logging during training; per-stage timing, MFU, CUDA memory snapshots and NVTX/Nsight Systems profiling of the training step; function benchmarks across implementations and shapes.
 
 ## Project Structure
 
@@ -38,13 +38,11 @@ High-level scripts and configurations:
 
 ### 3. `@profiling/` (Performance Toolkit)
 Standalone profiling workloads and configurations:
-- `profiling/profile_module.py`: Hydra entry point that profiles an `nn.Module` with per-stage timing, CUDA memory snapshots, and NVTX-annotated runs.
+- `profiling/profile_module.py`: Hydra entry point that profiles the training step of the configured model (the trainer's own `TrainStep`) with per-stage timing, MFU, peak memory, CUDA memory snapshots, and NVTX-annotated runs.
 - `profiling/bench_function.py`: Hydra entry point that benchmarks a single function across providers and shapes with Triton's `do_bench` and `perf_report`.
-- `profiling/cases.py`: Module workloads for a full language model, attention, RMSNorm, and feed-forward layers.
 - `profiling/functions.py`: Function workloads and their providers (e.g. Triton FlashAttention, the eager reference, and PyTorch SDPA).
-- `profiling/protocols.py`: Forward-only, full-training-step, and repeated-backward execution protocols.
-- `profiling/configs/`: Shared execution settings and per-target Hydra configs.
-- `profiling/examples/`: Full-model and attention sweep scripts, optionally captured with Nsight Systems.
+- `profiling/configs/`: The profiler config (which composes `apps/cfgs/training.yaml`) and the benchmark configs.
+- `profiling/examples/`: An LM profiling sweep and an attention benchmark sweep, optionally captured with Nsight Systems.
 
 The repository also includes `skills/pytorch-memory-report/`, which renders an interactive HTML report from a trusted PyTorch CUDA memory snapshot.
 
@@ -109,25 +107,22 @@ uv run apps/launch_training.py \
 
 **Profiling:**
 
-Profile a module (where time and memory go) with Hydra overrides:
+Training logs `perf/tokens_per_s`, `perf/mfu` and per-GPU peak memory at every log step. To see where the time and memory of a training step go, profile it. The profiler runs the trainer's own step on a synthetic batch, using the training config, so override the training keys (run from the repository root):
 
 ```bash
 uv run python -m profiling.profile_module \
-    case=attention \
-    profiling.protocol=full_training_step \
-    case.batch_size=8 \
-    case.seq_len=1024 \
-    case.d_model=2048 \
-    case.num_heads=16
+    model.attn_impl=flash_triton \
+    data.batch_size=64 \
+    profiling.nvtx.annotate_modules=false \
+    profiling.memory_profiling.enable=false
 ```
 
-Supported cases are `lm`, `attention`, `rmsnorm`, and `ffn`. Set `torch_compile.enable=true` to profile a compiled workload, or choose `forward_only`, `full_training_step`, or `repeat_backward_on_same_graph` with `profiling.protocol`. CUDA memory profiling is enabled by default and writes a `.pkl` snapshot under `profiling.output_dir`.
+It reports forward, backward, optimizer-step and total timings with achieved TFLOP/s and MFU, plus peak memory, and writes `metrics.json` under `profiling.output_dir`. Leave memory profiling on (the default) to also dump a `.pkl` CUDA memory snapshot. Because no data loading happens, its MFU is an upper bound for the trainer's.
 
-Run the example sweeps without Nsight Systems capture:
+Run the LM sweep without Nsight Systems capture:
 
 ```bash
 USE_NSYS=0 ./profiling/examples/run_lm_sweep.sh
-USE_NSYS=0 ./profiling/examples/run_attention_sweep.sh
 ```
 
 Benchmark a single function (how fast it is) across providers and a swept shape. This writes a CSV and a plot to `bench.output_dir`:
@@ -139,7 +134,7 @@ uv run python -m profiling.bench_function \
     'bench.sweep.x_vals=[512,1024,2048,4096]'
 ```
 
-See [profiling/README.md](profiling/README.md) for the difference between profiling and benchmarking, benchmark modes and providers, Nsight Systems capture, AMP and `torch.compile` options, artifact naming, and memory-report instructions. Only open memory snapshots from trusted sources because they use Python's pickle format.
+See [profiling/README.md](profiling/README.md) for the difference between profiling and benchmarking, how profiler MFU is counted, benchmark modes and providers, Nsight Systems capture, artifact naming, and memory-report instructions. Only open memory snapshots from trusted sources because they use Python's pickle format.
 
 ## Development Guidelines
 

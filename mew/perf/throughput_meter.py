@@ -3,6 +3,8 @@ import time
 
 import torch
 
+from mew.perf.utils import compute_mfu, peak_memory_stats
+
 
 class ThroughputMeter:
     def __init__(
@@ -49,12 +51,7 @@ class ThroughputMeter:
             torch.cuda.synchronize(self.device)
 
             # Record peak mem use
-            peak_mem_allocated_gib = (
-                torch.cuda.max_memory_allocated(self.device) / 2**30
-            )
-            peak_mem_reserved_gib = torch.cuda.max_memory_reserved(self.device) / 2**30
-            throughput_report["peak_mem_allocated_gib"] = peak_mem_allocated_gib
-            throughput_report["peak_mem_reserved_gib"] = peak_mem_reserved_gib
+            throughput_report.update(peak_memory_stats(self.device))
 
         # record window end
         w_end = self.clock()
@@ -65,10 +62,10 @@ class ThroughputMeter:
 
         # Calculate mfu
         if self.device_peak_tflops is not None:
-            mfu = (
-                tokens_per_s
-                * self.model_flops_per_token
-                / (self.device_peak_tflops * 1e12)
+            mfu = compute_mfu(
+                tokens_per_s=tokens_per_s,
+                model_flops_per_token=self.model_flops_per_token,
+                peak_tflops=self.device_peak_tflops,
             )
             throughput_report["mfu"] = mfu
 

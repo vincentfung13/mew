@@ -12,7 +12,8 @@ plausible-looking but wrong MFU. Add a row here, or set
 """
 
 from dataclasses import dataclass
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 import torch
 
@@ -102,3 +103,15 @@ def peak_tflops_per_second(
             f"Peak TFLOP/s is only defined for CUDA devices, got {device}."
         )
     return peak_tflops_for(torch.cuda.get_device_name(device), dtype, gpu_specs)
+
+
+def load_gpu_specs(raw: Iterable[Mapping[str, Any]]) -> list[GPUSpec]:
+    # Convert the cfg.gpu_specs entries (cfgs/gpu_specs.yaml) into GPUSpecs,
+    # naming the offending entry if one is malformed.
+    specs = []
+    for index, entry in enumerate(raw):
+        try:
+            specs.append(GPUSpec(**entry))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Invalid gpu_specs entry {index}: {error}") from error
+    return specs
