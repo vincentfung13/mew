@@ -27,7 +27,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from mew.perf.gpu_specs import load_gpu_specs, peak_tflops_per_second
 from mew.perf.utils import compute_mfu, module_flops_per_token, peak_memory_stats
-from mew.trainers.dist_context import DistContext
+from mew.parallel.dist_context import DistContext
 from mew.trainers.npt_trainer import TrainStep
 
 LOGGER = logging.getLogger(__name__)

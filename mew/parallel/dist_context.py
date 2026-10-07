@@ -9,6 +9,7 @@ class DistContext:
     rank: int
     local_rank: int
     world_size: int
+    is_main: bool
     device: torch.device
 
     @classmethod
@@ -20,5 +21,10 @@ class DistContext:
             rank=rank,
             local_rank=local_rank,
             world_size=world_size,
+            is_main=(rank == 0),
             device=torch.device("cuda", local_rank),
         )
+
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0

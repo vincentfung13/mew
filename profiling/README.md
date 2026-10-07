@@ -84,15 +84,16 @@ uv run python -m profiling.profile_module \
 
 ### Sweeps and Nsight Systems
 
-`examples/run_lm_sweep.sh` profiles a list of model sizes, each with and without
-bf16 AMP, and captures each run with Nsight Systems by default:
+`examples/run_lm_sweep.sh` profiles a list of model specs (size and attention
+implementation), each with and without bf16 AMP, and captures each run with
+Nsight Systems by default:
 
 ```bash
 ./profiling/examples/run_lm_sweep.sh
 USE_NSYS=0 ./profiling/examples/run_lm_sweep.sh
 ```
 
-Each run writes to `profiles/lm_<name>_b<batch>_s<seq>_<amp_bf16|fp32>/`.
+Each run writes to `profiles/lm_<name>_<attn_impl>_b<batch>_s<seq>_<amp_bf16|fp32>/`.
 Distributed (DDP/FSDP) profiling is not supported yet; the profiler raises if
 launched with more than one process.
 
@@ -209,14 +210,14 @@ uv run skills/pytorch-memory-report/scripts/render_memory_report.py \
 ```
 
 Memory snapshots and Nsight reports are named after their output directory. For
-example, `profiling.output_dir=profiles/lm_xl_b4_s256_amp_bf16` writes:
+example, `profiling.output_dir=profiles/lm_xl_flash_triton_b4_s256_amp_bf16` writes:
 
 ```text
-profiles/lm_xl_b4_s256_amp_bf16/
+profiles/lm_xl_flash_triton_b4_s256_amp_bf16/
 ├── metrics.json
 ├── profile_module.log
-├── lm_xl_b4_s256_amp_bf16.pkl
-└── lm_xl_b4_s256_amp_bf16.nsys-rep
+├── lm_xl_flash_triton_b4_s256_amp_bf16.pkl
+└── lm_xl_flash_triton_b4_s256_amp_bf16.nsys-rep
 ```
 
 The `.nsys-rep` file is produced only when `USE_NSYS=1`. Nsight Systems adds

@@ -15,7 +15,7 @@ import torch
 from hydra import compose, initialize_config_dir
 
 from mew.perf.utils import compute_mfu, module_flops_per_token
-from mew.trainers.dist_context import DistContext
+from mew.parallel.dist_context import DistContext
 from mew.trainers.npt_trainer import TrainStep
 from profiling.profile_module import (
     StageSummary,

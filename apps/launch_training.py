@@ -9,7 +9,7 @@ from omegaconf import OmegaConf
 
 from mew.perf.gpu_specs import load_gpu_specs, peak_tflops_per_second
 from mew.trainers.npt_trainer import NPTTrainer
-from mew.trainers.dist_context import DistContext
+from mew.parallel.dist_context import DistContext
 
 AMP_DTYPES = {"bf16": torch.bfloat16}
 

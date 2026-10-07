@@ -16,7 +16,7 @@ from mew.trainers.utils import (
     load_checkpoint,
     log_gradient_norm_and_weight_norm,
 )
-from mew.trainers.dist_context import DistContext
+from mew.parallel.dist_context import DistContext
 from mew.perf.utils import module_flops_per_token
 from mew.perf.throughput_meter import ThroughputMeter
 
