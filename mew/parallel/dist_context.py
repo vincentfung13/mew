@@ -20,7 +20,6 @@ class DistContext:
             rank=rank,
             local_rank=local_rank,
             world_size=world_size,
-            is_main=(rank == 0),
             device=torch.device("cuda", local_rank),
         )
 

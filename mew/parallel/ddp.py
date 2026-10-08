@@ -1,4 +1,4 @@
-import logging
+import itertools
 import weakref
 from contextlib import contextmanager
 
@@ -7,14 +7,11 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.autograd import Variable
 
-LOGGER = logging.getLogger(__name__)
+from mew.parallel.comm import broadcast_tensors
 
 
 class DistributedDataParallel(nn.Module):
-    def __init__(
-        self,
-        module: torch.nn.Module,
-    ):
+    def __init__(self, module: torch.nn.Module, broadcast_buffers: bool = True):
         super().__init__()
 
         self.module = module
@@ -24,16 +21,14 @@ class DistributedDataParallel(nn.Module):
         # on the step where there's an optim step
         self.sync_grad_flag = True
 
-        LOGGER.info("Broadcasting weights to all workers...")
-        with torch.no_grad():
-            _broadcast_handles = []
-            for parameter in module.parameters():
-                # Broadcast the model weights to all ranks from rank 0
-                _handle = dist.broadcast(parameter, src=0, async_op=True)
-                _broadcast_handles.append(_handle)
-            LOGGER.info("Waiting for the broadcast ops to finish...")
-            for handle in _broadcast_handles:
-                handle.wait()
+        # Boradcast params/buffer
+        self.broadcast_buffers = broadcast_buffers
+        if not broadcast_buffers:
+            broadcast_tensors(module.parameters(), sync=True)
+        else:
+            broadcast_tensors(
+                itertools.chain(module.parameters(), module.buffers()), sync=True
+            )
 
         # Using weakref here to handle the hooks, so that gc can remove the hooks
         # when the DDP ref is gc-ed
@@ -48,7 +43,6 @@ class DistributedDataParallel(nn.Module):
             watcher._on_grad_ready(param)
 
         # Register all-reduce hooks
-        LOGGER.info("Registering all reduce hooks for all grads...")
         self._grad_all_reduce_handles = []
         self._hook_handles = []
         for parameter in module.parameters():
@@ -62,23 +56,11 @@ class DistributedDataParallel(nn.Module):
 
     def forward(self, *args, **kwargs):
         self._callback_queued = False
+        # TODO for later: sync buffers only when buffers explicitly need per-forward syncing
+        # currently this does not hold (mainly for RoPE)
+        # if self.broadcast_buffers:
+        #     broadcast_tensors(self.module.buffers(), sync=True)
         return self.module(*args, **kwargs)
-
-    def __del__(self):
-        _hook_handles = getattr(self, "_hook_handles", [])
-        for _handle in _hook_handles:
-            _handle.remove()
-
-    def _sync_grads(self):
-        # This function waits for all grads to finish all reducing.
-        # it is queued into the autograd callback queue
-        # and automatically called by the autograd engine before loss.backward returns
-        # this happens in line ~96
-        for handle in self._grad_all_reduce_handles:
-            handle.wait()
-        # clear handles buffer
-        self._grad_all_reduce_handles = []
-        self._callback_queued = False
 
     @contextmanager
     def no_sync(self):
@@ -88,6 +70,11 @@ class DistributedDataParallel(nn.Module):
             yield
         finally:
             self.sync_grad_flag = previous
+
+    def __del__(self):
+        _hook_handles = getattr(self, "_hook_handles", [])
+        for _handle in _hook_handles:
+            _handle.remove()
 
     def _on_grad_ready(self, parameter: nn.parameter.Parameter):
         if not self.sync_grad_flag:
@@ -110,3 +97,14 @@ class DistributedDataParallel(nn.Module):
                 parameter.grad, op=dist.ReduceOp.SUM, async_op=True
             )
         self._grad_all_reduce_handles.append(_handle)
+
+    def _sync_grads(self):
+        # This function waits for all grads to finish all reducing.
+        # it is queued into the autograd callback queue
+        # and automatically called by the autograd engine before loss.backward returns
+        # this happens in _on_grad_ready
+        for handle in self._grad_all_reduce_handles:
+            handle.wait()
+        # clear handles buffer
+        self._grad_all_reduce_handles = []
+        self._callback_queued = False
