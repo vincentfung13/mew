@@ -50,7 +50,10 @@ def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Opt
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
     """
-    ddp_model.wait_for_backward()
+    # ddp_model.wait_for_backward()
+    # wait_for_backward() is handled by the autograd engine
+    # so only a no-op is needed here
+    return
 
 
 def get_fsdp(

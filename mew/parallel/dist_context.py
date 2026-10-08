@@ -9,7 +9,6 @@ class DistContext:
     rank: int
     local_rank: int
     world_size: int
-    is_main: bool
     device: torch.device
 
     @classmethod
