@@ -1,9 +1,13 @@
 import os
+import numpy as np
 import logging
+from contextlib import nullcontext
+
 
 from omegaconf import DictConfig
 
 import torch
+import torch.distributed as dist
 
 from mew.nn.utils import build_model
 from mew.nn.functionals import cross_entropy
@@ -17,6 +21,7 @@ from mew.trainers.utils import (
     log_gradient_norm_and_weight_norm,
 )
 from mew.parallel.dist_context import DistContext
+from mew.parallel.ddp import DistributedDataParallel as MewDDP
 from mew.perf.utils import module_flops_per_token
 from mew.perf.throughput_meter import ThroughputMeter
 
@@ -33,6 +38,11 @@ class TrainStep:
             cfg=cfg,
             device=dist_context.device,
         )
+        self._ddp_model = self.model
+        if dist_context.world_size > 1:
+            self._ddp_model = MewDDP(
+                self.model, broadcast_buffers=cfg.parallel.ddp.broadcast_buffers
+            )
         self.model_flops_per_token = (
             module_flops_per_token(module=self.model, seq_len=cfg.data.seq_len) * 3
         )
@@ -75,17 +85,15 @@ class TrainStep:
         target: torch.Tensor,
     ) -> torch.Tensor:
         with self._autocast():
-            logits = self.model(data)
+            logits = self._ddp_model(data)
             loss = cross_entropy(logits.float(), target)
         return loss
 
-    def backward(
-        self,
-        loss: torch.Tensor,
-    ):
+    def backward(self, loss: torch.Tensor, sync_grad: bool = True):
         # Handle gradient accmulation
         scaled_loss = loss / self.cfg.optim.grad_accumulation_steps
-        scaled_loss.backward()
+        with self._backward_context(sync_grad=sync_grad):
+            scaled_loss.backward()
 
     def optim_and_lr_scheduler_step(self):
         if self.cfg.optim.grad_clip_norm > 0:
@@ -104,10 +112,24 @@ class TrainStep:
             enabled=self.cfg.trainer.amp.enable,
         )
 
+    def _backward_context(self, sync_grad):
+        if isinstance(self._ddp_model, MewDDP) and (not sync_grad):
+            return self._ddp_model.no_sync()
+        else:
+            return nullcontext()
+
 
 class NPTTrainer:
     def __init__(self, cfg: DictConfig, dist_context: DistContext, wandb=None):
         self.dist_context = dist_context
+
+        # Init train step
+        self.train_step = TrainStep(cfg=cfg, dist_context=dist_context)
+        self.start_step = 0
+
+        # seed sequence root for data loaders
+        root = np.random.SeedSequence([cfg.seed, dist_context.rank])
+        train_seed_seq, val_seed_seq = root.spawn(2)
 
         # Init dataloader
         LOGGER.info(
@@ -120,6 +142,7 @@ class NPTTrainer:
             seq_len=cfg.data.seq_len,
             batch_size=cfg.data.batch_size,
             is_training=True,
+            seed_seq=train_seed_seq,
         )
         LOGGER.info(
             "Starting running validation, init val dataloader from %s with seq_len=%d",
@@ -131,11 +154,10 @@ class NPTTrainer:
             seq_len=cfg.data.seq_len,
             batch_size=cfg.data.batch_size,
             is_training=False,
+            seed_seq=val_seed_seq,
         )
 
-        # Init train step
-        self.train_step = TrainStep(cfg=cfg, dist_context=dist_context)
-        self.start_step = 0
+        # Resume
         if cfg.trainer.resume:
             LOGGER.info(
                 "Resume training from checkpoint: %s",
@@ -146,6 +168,8 @@ class NPTTrainer:
                 model=self.train_step.model,
                 optimizer=self.train_step.optim,
                 lr_scheduler=self.train_step.lr_scheduler,
+                train_data_loader=self.train_data_loader,
+                val_data_loader=self.val_data_loader,
             )
 
         # Throughput meter for MFU logging
@@ -171,13 +195,16 @@ class NPTTrainer:
 
             # Forward and backward
             loss = self.train_step.forward(data=data, target=target)
-            self.train_step.backward(loss)
+            self.train_step.backward(
+                loss, sync_grad=(step % self.cfg.optim.grad_accumulation_steps == 0)
+            )
 
             # Optional: log grad and weight norm (adds overhead to training)
             if (
                 self.cfg.trainer.log_grads_and_weights_norm
                 and step % self.cfg.trainer.log_freq == 0
                 and step % self.cfg.optim.grad_accumulation_steps == 0
+                and self.dist_context.is_main
             ):
                 log_gradient_norm_and_weight_norm(
                     wandb=self.wandb,
@@ -211,7 +238,7 @@ class NPTTrainer:
                 for key, val in self.throughput_meter.report().items():
                     log_item["perf/" + key] = val
 
-                if self.wandb is not None:
+                if self.wandb is not None and self.dist_context.is_main:
                     self.wandb.log(log_item, step=step)
 
                 LOGGER.info(
@@ -228,20 +255,25 @@ class NPTTrainer:
 
             # Save checkpoint
             if step % self.cfg.trainer.save_freq == 0:
-                if not os.path.isdir(self.cfg.save_dir):
-                    os.makedirs(self.cfg.save_dir)
-                ckpt_path = os.path.join(
-                    self.cfg.save_dir,
-                    f"checkpoint_step_{step}.pt",
-                )
-                save_checkpoint(
-                    model=self.train_step.model,
-                    optimizer=self.train_step.optim,
-                    iteration=step,
-                    output_path=ckpt_path,
-                    lr_scheduler=self.train_step.lr_scheduler,
-                )
-                LOGGER.info(f"Checkpoint saved to {ckpt_path}")
+                if self.dist_context.is_main:
+                    if not os.path.isdir(self.cfg.save_dir):
+                        os.makedirs(self.cfg.save_dir)
+                    ckpt_path = os.path.join(
+                        self.cfg.save_dir,
+                        f"checkpoint_step_{step}.pt",
+                    )
+                    save_checkpoint(
+                        model=self.train_step.model,
+                        optimizer=self.train_step.optim,
+                        iteration=step,
+                        output_path=ckpt_path,
+                        lr_scheduler=self.train_step.lr_scheduler,
+                        train_batch_spawned=self.train_data_loader.num_batches_spawned(),
+                        val_batch_spawned=self.val_data_loader.num_batches_spawned(),
+                    )
+                    LOGGER.info(f"Checkpoint saved to {ckpt_path}")
+                if self.dist_context.world_size > 1:
+                    dist.barrier()
 
 
 def _logging_format(key: str, value: float) -> str:

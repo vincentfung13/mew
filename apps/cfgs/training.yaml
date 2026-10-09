@@ -7,7 +7,8 @@ defaults:
 task_name: npt_training
 run_name: pilot_run
 device: cuda
-# Seeds python, numpy (data sampling) and torch (weight init) RNGs; null disables seeding
+# Required. Seeds torch (weight init, shared by all ranks) and the data loaders'
+# sampling streams (derived per rank from [seed, rank])
 seed: 42
 save_dir: checkpoints/${run_name}/${now:%Y-%m-%d-%H-%M-%S}
 
@@ -23,7 +24,8 @@ data:
   # This is use to save the tokenizer used to tokenize the training set
   # it's for tracking purposes and does not take effect in actual training
   tokenizer_path: data/tinystories_bpe_tokenizer
-   
+
+
 model:
   d_model: 512 
   d_ff: 1344 
@@ -53,6 +55,11 @@ trainer:
     # null = look up from the GPU name and AMP dtype in gpu_specs.yaml; stays
     # null on non-CUDA devices, where MFU is undefined.
     peak_tflops: null
+
+parallel:
+  backend: null 
+  ddp:
+    broadcast_buffers: true
 
 # AdawmW params
 optim:
