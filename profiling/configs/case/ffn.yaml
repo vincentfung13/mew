@@ -1,7 +1,0 @@
-name: ffn
-
-batch_size: 4
-seq_len: 256
-
-d_model: 768
-d_ff: 3072

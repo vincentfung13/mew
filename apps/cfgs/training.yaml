@@ -1,25 +1,44 @@
 defaults:
   - _self_
+  # GPU peak FLOP/s table for MFU, available as cfg.gpu_specs
+  - gpu_specs
   - override hydra/job_logging: custom
 
 task_name: npt_training
 run_name: pilot_run
 device: cuda
-save_dir: checkpoints/${run_name}/${now:%Y-%m-%d-%H-%M-%S}
+# Required. Seeds torch (weight init, shared by all ranks) and the data loaders'
+# sampling streams (derived per rank from [seed, rank])
+seed: 42
+# Each torchrun worker resolves ${now:...} on its own; launch_training.py
+# broadcasts rank 0's run_id so every rank shares one save_dir
+run_id: ${now:%Y-%m-%d-%H-%M-%S}
+save_dir: checkpoints/${run_name}/${run_id}
 
 hydra:
   run:
     dir: ${save_dir}
+  job_logging:
+    formatters:
+      simple:
+        # Global rank in every line, so console warnings and log files say which rank wrote them
+        format: '[%(asctime)s][rank${oc.env:RANK,0}][%(name)s][%(levelname)s] - %(message)s'
+    handlers:
+      file:
+        # One log file per rank, all in the shared save_dir
+        filename: ${hydra:runtime.output_dir}/${hydra:job.name}_rank${oc.env:RANK,0}.log
 
 data:
-  train_file: data/tiny_stories_train.tokens.fixed.uint16.npy 
-  val_file: data/tiny_stories_val.tokens.fixed.uint16.npy
+  train_file: data/tiny_stories_train.tokens.uint16.npy
+  val_file: data/tiny_stories_val.tokens.uint16.npy
+  # For DDP - this means micro batch size (batch size per GPU)
   batch_size: 128 
   seq_len: 256 
   # This is use to save the tokenizer used to tokenize the training set
   # it's for tracking purposes and does not take effect in actual training
   tokenizer_path: data/tinystories_bpe_tokenizer
-   
+
+
 model:
   d_model: 512 
   d_ff: 1344 
@@ -38,11 +57,22 @@ trainer:
   total_steps: 10000 
   save_freq: 10000
   log_freq: 10
+  log_grads_and_weights_norm: false
   resume_checkpoint_path: null
   resume: false
   amp:
     enable: true
     dtype: bf16
+  perf:
+    # Peak dense TFLOP/s of one GPU for the matmul dtype (the MFU denominator).
+    # null = look up from the GPU name and AMP dtype in gpu_specs.yaml; stays
+    # null on non-CUDA devices, where MFU is undefined.
+    peak_tflops: null
+
+parallel:
+  backend: null 
+  ddp:
+    broadcast_buffers: true
 
 # AdawmW params
 optim:

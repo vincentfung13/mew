@@ -17,6 +17,7 @@ class Linear(nn.Module):
         super().__init__()
 
         # Create weight Tensor
+        self.in_features, self.out_features = in_features, out_features
         self.weights = nn.Parameter(torch.empty(out_features, in_features))
 
         # Init weights
@@ -35,6 +36,9 @@ class Linear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weights = self.weights
         return einsum(weights, x, "out_feats in_feats, ... in_feats -> ... out_feats")
+
+    def flops_per_token(self, seq_len: int) -> int:
+        return 2 * self.in_features * self.out_features
 
 
 class Embedding(nn.Module):
@@ -62,6 +66,10 @@ class Embedding(nn.Module):
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.weights[token_ids]
+
+    def flops_per_token(self, seq_len: int) -> int:
+        # There's no matmul in Embedding, so we ignore the flops
+        return 0
 
 
 class RMSNorm(nn.Module):
@@ -101,12 +109,20 @@ class RMSNorm(nn.Module):
 
         return x.to(in_dtype)
 
+    def flops_per_token(self, seq_len: int) -> int:
+        # There's no matmul in RMSNorm, so we ignore the flops
+        return 0
+
 
 class SwiGLU(nn.Module):
     def __init__(
         self, d_model: int, d_ff: int, device: str = None, dtype: torch.dtype = None
     ):
         super().__init__()
+
+        # Record d_ff / d_model for MFU recording
+        self.d_model, self.d_ff = d_model, d_ff
+
         # Create weight Tensor
         # w1 and w3 cast input to d_ff
         # w2 casts d_ff to d_model and produce output
@@ -141,3 +157,18 @@ class SwiGLU(nn.Module):
         mul = einsum(silu_w1_x, w3_x, "... d_ff, ... d_ff -> ... d_ff")
         output = einsum(self.w2, mul, "d_model d_ff, ... d_ff -> ... d_model")
         return output
+
+    def flops_per_token(self, seq_len: int) -> int:
+        flops_per_token = 0
+
+        # 1. self.w1 @ x ("d_ff d_model, ... d_model -> ... d_ff")
+        flops_per_token += 2 * self.d_ff * self.d_model
+
+        # 2. self.w3 @ x ("d_ff d_model, ... d_model -> ... d_ff")
+        flops_per_token += 2 * self.d_ff * self.d_model
+
+        # 3. silu_w1_x and mul are ele-wise ops
+        # 4. w2 @ mul contracts d_ff
+        flops_per_token += 2 * self.d_model * self.d_ff
+
+        return flops_per_token

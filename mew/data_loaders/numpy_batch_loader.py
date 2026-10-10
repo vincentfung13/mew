@@ -15,6 +15,7 @@ class NumpyBatchLoader:
         batch_size: int,
         dtype=np.uint16,
         is_training: bool = True,
+        seed_seq: np.random.SeedSequence | None = None,
     ):
         """
         Memory-optimized loader for massive memmap files.
@@ -27,6 +28,11 @@ class NumpyBatchLoader:
         self.batch_size = batch_size
         self.token_num = len(self.data)
         self.is_training = is_training
+
+        if seed_seq is None:
+            self.seed_seq = np.random.SeedSequence()
+        else:
+            self.seed_seq = seed_seq
 
         # Instead of every index, we track "chunks" or "offsets"
         # Total valid starting positions
@@ -42,8 +48,14 @@ class NumpyBatchLoader:
 
     def get_batch(self, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
         # Sampling with replacement during training & training-time validation
-        indices = np.random.randint(
-            0, len(self.data) - self.seq_len, size=self.batch_size
+        # indices = np.random.randint(
+        #     0, len(self.data) - self.seq_len, size=self.batch_size
+        # )
+        child = self.seed_seq.spawn(1)[0]
+        indices = (
+            np.random.default_rng(child)
+            .integers(0, len(self.data) - self.seq_len, self.batch_size)
+            .tolist()
         )
 
         # Efficient batch construction
@@ -58,3 +70,14 @@ class NumpyBatchLoader:
         y = torch.from_numpy(np.stack(y_list)).to(device).long()
 
         return x, y
+
+    def resume(self, num_batches_drawn: int) -> None:
+        self.seed_seq = np.random.SeedSequence(
+            entropy=self.seed_seq.entropy,
+            spawn_key=self.seed_seq.spawn_key,
+            pool_size=self.seed_seq.pool_size,
+            n_children_spawned=num_batches_drawn,
+        )
+
+    def num_batches_spawned(self) -> int:
+        return self.seed_seq.n_children_spawned
