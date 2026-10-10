@@ -228,15 +228,26 @@ class NPTTrainer:
                     )
                     val_loss = self.train_step.forward(data=val_data, target=val_target)
 
+                    # All reduce loss for the DDP case
+                    loss_buf = torch.stack([loss, val_loss])
+                    if self.dist_context.world_size > 1:
+                        dist.all_reduce(loss_buf, op=dist.ReduceOp.SUM)
+                        loss_buf /= self.dist_context.world_size
+
                 # Create item for logging
                 log_item = {
-                    "train/loss": loss.item(),
-                    "val/loss": val_loss.item(),
+                    "train/loss": loss_buf[0].item(),
+                    "val/loss": loss_buf[1].item(),
                     "train/lr": self.train_step.optim.param_groups[0]["lr"],
                 }
+
                 # retrieve throughput stats
-                for key, val in self.throughput_meter.report().items():
-                    log_item["perf/" + key] = val
+                log_item.update(
+                    _sync_throughput_report(
+                        throughput_report=self.throughput_meter.report(),
+                        dist_context=self.dist_context,
+                    )
+                )
 
                 if self.wandb is not None and self.dist_context.is_main:
                     self.wandb.log(log_item, step=step)
@@ -287,3 +298,32 @@ def _logging_format(key: str, value: float) -> str:
     if key.endswith("lr"):
         return f"{value:.2e}"
     return f"{value:.4f}"
+
+
+def _sync_throughput_report(throughput_report: dict, dist_context: DistContext) -> dict:
+    if dist_context.world_size == 1:
+        return {f"perf/{k}": v for k, v in throughput_report.items()}
+
+    with torch.no_grad():
+        new_throughput_report = {}
+        metrics = list(throughput_report.keys())
+        vals = torch.tensor(
+            list(throughput_report.values()), device=dist_context.device
+        )
+        gathered = [
+            torch.empty_like(vals, device=dist_context.device)
+            for _ in range(dist_context.world_size)
+        ]
+
+        # All gather into val_buffer
+        dist.all_gather(gathered, vals)
+        gathered = torch.stack(gathered)  # (world_size, n_metrics)
+        max_vals = gathered.amax(dim=0)  # (n_metrics,)
+        min_vals = gathered.amin(dim=0)  # (n_metrics,)
+        mean_vals = gathered.mean(dim=0)  # (n_metrics,)
+        for ind, metric in enumerate(metrics):
+            new_throughput_report[f"perf/{metric}"] = mean_vals[ind].item()
+            new_throughput_report[f"perf/min/{metric}"] = min_vals[ind].item()
+            new_throughput_report[f"perf/max/{metric}"] = max_vals[ind].item()
+            new_throughput_report[f"perf/local/{metric}"] = vals[ind].item()
+    return new_throughput_report
