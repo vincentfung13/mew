@@ -24,7 +24,7 @@ This repo exists so the user can learn how a GPT-like model works by implementin
 
 ## 1. Background
 
-The codebase provides the core building blocks to train and run inference on a neural probabilistic language model. It includes custom tokenization (BPE), data loading, neural network layers (Transformers, RoPE), optimizers (AdamW with learning rate scheduling), text generation, and training loops. It also includes a standalone toolkit for profiling the model's training step and benchmarking individual functions. The project allows users to understand, experiment with, and measure the fundamental components of modern generative AI models.
+The codebase provides the core building blocks to train and run inference on a neural probabilistic language model. It includes custom tokenization (BPE), data loading, neural network layers (Transformers, RoPE), optimizers (AdamW with learning rate scheduling), text generation, training loops, and hand-written distributed training (DDP, with FSDP, TP, PP, CP and EP planned in `docs/ROADMAP.md`). It also includes a standalone toolkit for profiling the model's training step and benchmarking individual functions. The project allows users to understand, experiment with, and measure the fundamental components of modern generative AI models.
 
 ## 2. High-Level Design and Modules
 
@@ -37,10 +37,13 @@ The architecture is separated into the core library, application entry points, a
   - `mew/optimizers/`: Provides optimization algorithms like AdamW and custom learning rate scheduling.
   - `mew/tokenization/`: Contains the custom Byte-Pair Encoding (BPE) tokenizer and text processing utilities.
   - `mew/trainers/`: Implements the training loops and utilities for training the language model (e.g., `NPTTrainer`).
+  - `mew/parallel/`: Distributed training. `dist_context.py` (`DistContext`: rank, local rank, world size and device from the `torchrun` environment; process-group init and shutdown), `ddp.py` (the DDP wrapper: per-parameter async all-reduce from post-accumulate-grad hooks, waited on through an autograd engine callback, plus `no_sync()`), and `comm.py` (collective helpers).
+  - `mew/perf/`: FLOPs-per-token accounting (`utils.module_flops_per_token`), the GPU peak table (`gpu_specs.py`), `compute_mfu`/peak-memory helpers, and `ThroughputMeter`.
 - **`@apps/`** **(Application Layer):**
   - Contains high-level scripts to execute workflows using the `mew` library.
   - `apps/cfgs/`: Stores Hydra configurations for tokenization, training, and inference.
-  - `apps/launch_training.py` & `apps/tokenization.py`: Entry points for launching model training and running the data tokenization pipelines.
+  - `apps/launch_training.py` & `apps/tokenization.py`: Entry points for launching model training and running the data tokenization pipelines. `launch_training.py` runs on one GPU or under `torchrun`; see Section 7.
+  - `apps/cfgs/gpu_specs.yaml`: Peak dense TFLOP/s per GPU model, composed into `training.yaml` as `cfg.gpu_specs` and used as the MFU denominator.
 - **`@profiling/`** **(Performance Toolkit):**
   - `profiling/profile_module.py`: Hydra entry point that *profiles* the model's training step (where time and memory go). It runs the trainer's `TrainStep` (`mew/trainers/npt_trainer.py`) on a synthetic batch and reports per-stage timing (forward, backward, optimizer step, total), achieved TFLOP/s and MFU, and peak memory, with optional NVTX annotation and CUDA memory snapshots.
   - `profiling/bench_function.py`: Hydra entry point that *benchmarks* a single function (how fast it is) across providers and a swept shape, using `triton.testing.do_bench` and `perf_report`. Layer-level comparisons belong here.
@@ -49,6 +52,8 @@ The architecture is separated into the core library, application entry points, a
   - `profiling/examples/`: Provides an LM sweep and an attention benchmark sweep, with optional Nsight Systems capture.
 - **`@skills/`** **(Reusable Analysis Workflows):**
   - `skills/pytorch-memory-report/`: Renders and interprets trusted PyTorch CUDA memory snapshots as interactive HTML reports.
+- **`@docs/`** **(Planning):**
+  - `docs/ROADMAP.md`: The distributed-training roadmap (phases, parity tests, benchmarks against PyTorch/TorchTitan).
 
 ## 3. Package Management
 
@@ -69,6 +74,7 @@ The architecture is separated into the core library, application entry points, a
 ## 5. Testing
 
 - After any code change, **propose** running the test suite (`uv run pytest`) to make sure nothing regresses, and run it only once approved (Section 0.1).
+- Distributed code is tested on CPU with the gloo backend through `torch.multiprocessing.spawn`: `tests/systems/test_ddp.py` (DDP wrapper parity against single-process training, through `tests/systems/adapters.py`) and `tests/systems/test_trainer_dist_logging.py` (cross-rank throughput reporting). Prefer a `file://` rendezvous in `tmp_path` over a fixed `MASTER_PORT` in new tests. Per-rank data seeding and checkpoint resume are tested in `tests/basics/test_data_loader_seeding.py`. NCCL and multi-GPU behavior still need a GPU machine.
 - The module profiler has CPU-compatible tests under `tests/basics/test_profile_module.py` (config composition, peak resolution, stage running, summary math, an end-to-end CPU run), and the shared MFU/memory helpers under `tests/basics/test_perf_utils.py`; function benchmark configs, providers, and modes are tested on CPU in `tests/basics/test_bench_function.py`. CUDA, `do_bench`, the `flash_triton` provider, and Nsight behavior still require an appropriate GPU environment for end-to-end validation.
 
 ## 6. Profiling and Benchmarking Conventions
@@ -86,3 +92,13 @@ The architecture is separated into the core library, application entry points, a
 - Treat PyTorch memory snapshots as untrusted pickle data unless their provenance is known. Never load or render a snapshot from an untrusted source.
 - When interpreting memory reports, separate measured observations from hypotheses and do not infer a leak from allocation traffic alone.
 
+## 7. Distributed Training Conventions
+
+- Launch multi-GPU training with `uv run torchrun --standalone --nproc_per_node=<N> apps/launch_training.py parallel.backend=nccl ...`. A non-null `parallel.backend` requires a `torchrun` launch (checked by `dist.is_torchelastic_launched()`); a plain `uv run` launch keeps `parallel.backend=null` and runs without a process group.
+- `data.batch_size` is the per-GPU micro batch. The global batch is `data.batch_size × optim.grad_accumulation_steps × world_size`; when comparing with a single-GPU run, state which of these was held fixed.
+- `TrainStep` keeps `self.model` as the raw module (checkpoints without a `module.` prefix, FLOP counting, NVTX, grad-norm logging) and calls through a separate handle that is the DDP wrapper only when `world_size > 1`. Gradient sync is skipped with `no_sync()` on non-boundary micro-batches; the decision lives in `TrainStep`, the mechanism in the wrapper.
+- Side effects run on rank 0 only: config and tokenizer copies, checkpoints (followed by a barrier), and the W&B run. Collectives (loss all-reduce, throughput all-gather, barriers) must be called on every rank, never inside an `is_main` branch, or the run hangs.
+- Every rank shares rank 0's `run_id` (`sync_run_id` in `apps/launch_training.py` broadcasts it, because Hydra resolves `${now:...}` per process), so all ranks write into one `save_dir`. Each rank logs to `<job>_rank<R>.log`, log lines carry `[rank<R>]`, and non-main ranks' console handlers are raised to WARNING.
+- Logged metrics: losses are averaged across ranks; `perf/<metric>` is the cross-rank mean (so it matches the single-GPU key), with `perf/min/*`, `perf/max/*` and `perf/local/*` alongside. Prefer SUM-then-divide and `all_gather` over `ReduceOp.AVG`, which gloo lacks.
+- Data sampling is per rank and counter-based: the trainer derives train/val `np.random.SeedSequence` streams from `[seed, rank]`, each batch spawns one child, and checkpoints store the spawn counts so `resume` fast-forwards exactly. `seed` is required. Resume a DDP run with the same world size.
+- Correctness before speed: validate a DDP change against the single-GPU run (same global batch, matching loss curve, identical gradients across ranks) before optimizing it.

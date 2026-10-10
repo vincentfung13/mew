@@ -13,7 +13,8 @@ A custom implementation of a GPT-like language model developed entirely from scr
 - **Neural Network Architecture**: Custom Transformer blocks, Rotary Positional Embeddings (RoPE), and linear layers built with PyTorch.
 - **Optimizers**: Custom AdamW optimizer with learning rate scheduling.
 - **Generators**: Autoregressive text generation logic.
-- **Trainer**: Training loops with experiment tracking (W&B integration).
+- **Trainer**: Training loops with experiment tracking (W&B integration), seeded and exactly resumable data sampling.
+- **Distributed Training**: A hand-written DistributedDataParallel (DDP) wrapper with gradient accumulation (`no_sync`), launched with `torchrun` for single-node multi-GPU training.
 - **Configuration Management**: Hydra-based configuration for easy parameter sweeping and experiment management.
 - **Performance Profiling**: MFU, tokens/s and peak-memory logging during training; per-stage timing, MFU, CUDA memory snapshots and NVTX/Nsight Systems profiling of the training step; function benchmarks across implementations and shapes.
 
@@ -29,11 +30,13 @@ The core engine behind the language model:
 - `mew/optimizers/`: Custom optimizers and schedulers (AdamW, LR scheduling).
 - `mew/tokenization/`: BPE tokenizer and text processing tools.
 - `mew/trainers/`: Implementations of the training loops (e.g., `NPTTrainer`).
+- `mew/parallel/`: Distributed training: `DistContext` (rank, world size and device from the `torchrun` environment, process-group setup), the DDP wrapper (`ddp.py`), and collective helpers (`comm.py`).
+- `mew/perf/`: FLOPs-per-token accounting, the GPU peak-throughput table, MFU and peak-memory helpers, and the `ThroughputMeter` used by the trainer.
 
 ### 2. `@apps/` (Application Layer)
 High-level scripts and configurations:
-- `apps/cfgs/`: Hydra configuration files (`training.yaml`, `inference.yaml`, `tokenization.yaml`).
-- `apps/launch_training.py`: Entry point for launching model training.
+- `apps/cfgs/`: Hydra configuration files (`training.yaml`, `inference.yaml`, `tokenization.yaml`, and `gpu_specs.yaml`, the per-GPU peak TFLOP/s table used for MFU).
+- `apps/launch_training.py`: Entry point for launching model training, on one GPU or under `torchrun`.
 - `apps/tokenization.py`: Entry point for running the data tokenization pipelines.
 
 ### 3. `@profiling/` (Performance Toolkit)
@@ -44,7 +47,7 @@ Standalone profiling workloads and configurations:
 - `profiling/configs/`: The profiler config (which composes `apps/cfgs/training.yaml`) and the benchmark configs.
 - `profiling/examples/`: An LM profiling sweep and an attention benchmark sweep, optionally captured with Nsight Systems.
 
-The repository also includes `skills/pytorch-memory-report/`, which renders an interactive HTML report from a trusted PyTorch CUDA memory snapshot.
+The repository also includes `skills/pytorch-memory-report/`, which renders an interactive HTML report from a trusted PyTorch CUDA memory snapshot, and [docs/ROADMAP.md](docs/ROADMAP.md), the plan for distributed training (DDP, then FSDP, TP, PP, CP and EP).
 
 ## Setup and Installation
 
@@ -105,6 +108,26 @@ uv run apps/launch_training.py \
 ```
 *Note: The launch scripts use Hydra, so you can override configurations via the CLI (e.g., `uv run apps/launch_training.py wandb.enable=True`).*
 
+Each run writes its config copy, tokenizer copy, checkpoints and log files to `checkpoints/<run_name>/<run_id>/` (`run_id` defaults to the launch time). `seed` is required: it seeds weight init and the data loaders' sampling streams, whose positions are saved in checkpoints so a resumed run draws the same batches as an uninterrupted one. Resume with `trainer.resume=true trainer.resume_checkpoint_path=<path to checkpoint>`.
+
+**Distributed training (single node, multiple GPUs):**
+
+Launch the same script with `torchrun`, one process per GPU, and set the backend:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 uv run torchrun --standalone --nproc_per_node=2 apps/launch_training.py \
+    parallel.backend=nccl \
+    run_name=ddp_pilot \
+    data.batch_size=64
+```
+
+- `--nproc_per_node=gpu` uses every visible GPU. `parallel.backend` must stay `null` (the default) for a plain `uv run` launch.
+- `data.batch_size` is the **per-GPU** micro batch, so the global batch is `data.batch_size × optim.grad_accumulation_steps × world_size`. Halving `data.batch_size` on 2 GPUs (as above) keeps the global batch, and hence the loss curve, comparable with a 1-GPU run.
+- `trainer.total_steps` counts loop iterations, so each step processes `world_size` times more tokens than on one GPU.
+- Rank 0 writes the config, tokenizer copy, checkpoints and the W&B run; all ranks share rank 0's `run_id`, and each writes its own `launch_training_rank<R>.log`. The console shows rank 0's output plus warnings from every rank.
+- Logged `train/loss` and `val/loss` are averaged across ranks. `perf/<metric>` is the cross-rank mean, with `perf/min/*` and `perf/max/*` to spot a slow rank; each rank's own numbers are under `perf/local/*` in its log file.
+- Each rank samples its own batches from a stream derived from `[seed, rank]`, so resume a DDP run with the same number of GPUs.
+
 **Profiling:**
 
 Training logs `perf/tokens_per_s`, `perf/mfu` and per-GPU peak memory at every log step. To see where the time and memory of a training step go, profile it. The profiler runs the trainer's own step on a synthetic batch, using the training config, so override the training keys (run from the repository root):
@@ -146,5 +169,7 @@ uvx black mew/ apps/ tests/
 uvx flake8 --ignore=E501 mew/ apps/ tests/
 uv run pytest
 ```
+
+The distributed tests (`tests/systems/test_ddp.py`, `tests/systems/test_trainer_dist_logging.py`) spawn CPU processes on the gloo backend, so they run without GPUs.
 
 See [AGENTS.md](AGENTS.md) for more details regarding instructions for AI agents and code contributors.
