@@ -64,10 +64,11 @@ def build_dist_context(device_type: str) -> DistContext:
         return DistContext(
             rank=0, local_rank=0, world_size=1, device=torch.device(device_type)
         )
-    dist_context = DistContext.from_env()
+    # Binds this process to its GPU (and would init a process group under torchrun)
+    dist_context = DistContext.set_up_dist_env(dist_backend=None)
     if dist_context.world_size > 1:
+        dist_context.shutdown()
         raise NotImplementedError("Distributed profiling is not supported yet.")
-    torch.cuda.set_device(dist_context.device)
     return dist_context
 
 
